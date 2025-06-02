@@ -1,0 +1,694 @@
+# CKOS – STM32L4 Firmware Documentation
+
+## 1. Project Overview
+	### 1.1 Core Concept
+		CKOS is firmware for the STM32L4-based "Keeper" device, designed for the STM32L452CEU6 and STM32CubeIDE.
+		Keeper securely holds keys for a user for a specified time.
+		
+		Project Status: Implementation in progress
+		Target Hardware: STM32L452CEU6 (Arm Cortex-M4 @ up to 80MHz, 512KB Flash, 160KB SRAM), monochrome LCD (128 × 64).
+	
+	### 1.2 Device Purpose
+		- Secure time-based access control to physical keys.
+		- Configurable lock types for various locking strategies.
+		- Interactive modes via agent personalities and games.
+		- Designed for reliability, power efficiency, and user engagement.
+	
+	### 1.3 Physical Specifications
+		- Form Factor: Compact, handheld, battery-powered.
+		- Display: 128 × 64 monochrome transflective LCD, white LED back-light.
+		- Input: 
+			* 4-button D-pad + A (Enter) & B (Back) buttons.
+			* DFU bootloader button (internal, accessible when physical device enclosure is opened).
+		- Locking Mechanism: Memory wire-based latch. Acrylic clear door.
+		- Power Source: Li-ion polymer, 3.7 V nominal, 1500 mAh.
+		- Operating Temperature: 0 – 40 °C (These are qualification targets; no user warnings or specific behavior changes are implemented if outside this range. Functionality is expected to meet specs within this range).
+
+## 2. User Interaction Flow
+	### 2.1 Setup Process
+		#### 2.1.1 First-time configuration
+			- Welcome screen on first power-up.
+			- User sets their local timezone (as an offset from UTC) and Daylight Saving Time (DST) status. These settings, along with preferences (e.g., display brightness, contrast, display sleep timeout, UI themes when implemented), are configured.
+			- User confirms or sets the current time and date in their current time zone. The time may already be pre-set (e.g., during firmware update or factory flashing). If changed the device calcualtes and sets the UTC based on the set time zone
+		
+		#### 2.1.2 Lock selection
+			- Navigate to main menu. Only one option is shown in the center of the screen with a representative graphic. Arrows on the sides indicate scrollability. Scrolling between options will have a visual animation. Four top-level options: Agent, Custom, Keyholder lock types, and Settings.
+		
+		#### 2.1.3 Lock configuration
+			- Agent lock: User selects one of the available agent characters (currently 3 planned: Beginner, Advanced, Permanent; more planned for future). Each agent has a distinct character, specific animations/images, and pre-defined behaviors/dialog. User interacts with the agent by selecting options from a list presented on the screen; some options may be unavailable based on context or agent mood. Agents have internal 'mood levels' (e.g., 'irritated') that can change based on user interactions (e.g., begging via menu selection). These mood levels influence agent decisions/odds and may eventually be displayed to the user. Agent behavior can also vary based on the total accumulated locked time for the current lock type (Beginner, Advanced, Permanent each have their own counters stored persistently). Agents are selected when the device is unlocked. The current lock session time is tracked and does not accrue if the user is briefly released (e.g., for a 'clean' or 'break' – see below) but the door remains closed and the session is resumed. Total device time for each lock type and current lock session time are distinct values.
+				* **Cleaning/Breaks:** This feature allows the device to be temporarily unlocked for a user-initiated or pre-configured break. A time limit is set for how long the device can remain unlocked and when it must be relocked. If the user exceeds this time limit for relocking, the agent's mood may be negatively affected, and the current accumulated session lock time might be reset as a penalty. The specifics of break duration and frequency can be configured, potentially via "config keys" in the Keyholder lock mode.
+			- Custom lock: User sets lock duration using a flexible UI component (selecting minutes, hours, days, years; min 1 minute, max 100 years). Durations over 1 year require multiple user confirmations and warnings. User can add/configure optional games to modify lock conditions (primarily time modification).
+			- Keyholder lock: 
+				* **Basic Mode:** Configure a PIN for simple safe mode. PIN entry is done via an on-screen numeric keypad, navigated using the D-pad, with the 'A' button to select a number and the 'B' button to delete the last entered number. This PIN entry UI is a reusable component.
+				* **Remote Keyholder Mode (Web Service Bound):**
+					* **Pairing:** Can optionally be bound to an external web service. Binding involves the website providing a code that the user enters on the device. Re-pairing to a new web service session can only occur when the device is unlocked.
+					* **Connection Identicon:** Each successful binding to a web service session is represented by a unique 5x5 Identicon (a hashed visual pattern, similar to GitHub's) displayed on the device. This Identicon changes if the device is re-paired.
+					* **Unlock Keys:** The primary way to unlock when bound. The web service provides rolling/sequential unlock codes (e.g., device accepts current index + a fixed window like 5 codes ahead to maintain sync). Each code is single-use. This system does not rely on the RTC. If a future-dated code is used, the device's index advances, invalidating previous codes.
+					* **Cleaning Keys:** The remote keyholder can issue "cleaning keys." These are special codes entered on a dedicated screen on the device to authorize a temporary unlock for a pre-defined duration (similar to the "Cleaning/Breaks" feature). After the device is relocked, a confirmation screen displays the duration of the unlock, the current device date & time, and the active connection Identicon.
+					* **Config Keys:** Longer codes, also provided by the remote keyholder, entered on the device to change lock parameters. These can adjust settings like the duration of cleaning breaks, set up automated scheduled breaks (e.g., a 10-minute break every day), or modify other lock behaviors as defined by the keyholder service.
+					* **Verification Screen:** The device confirmation screen for third-party verification (e.g., when a key is used or for general status check) will display: total locked time since the last door opening for this lock instance, current device date & time, the unique factory-set device serial number, and the current connection Identicon.
+	
+	### 2.2 Physical Operation
+		#### 2.2.1 Locking process
+			- User places items, closes door. The 'latch' mechanism engages in a groove on the door. A spring keeps the latch engaged.
+			- Device detects door closure. This is determined by two sensors: 
+				1. The 'ejector' lever sensor indicates the physical presence of the door/pin (door closed = sensor activated).
+				2. The 'latch' sensor indicates the latch has moved into the locked position (door closed = latch sensor activated as latch is pushed out of the way by the door).
+			- Device confirms lock, starts timer.
+			- Display shows confirmation and lock details.
+		
+		#### 2.2.2 During locked period
+			- Display shows remaining time and status.
+			- Optional interaction with agent or games.
+			- Low-power mode when not interacting.
+		
+		#### 2.2.3 Unlocking process
+			- Timer expires or valid unlock condition met, unlock sequence initiates.
+			- Display shows unlocking progress.
+			- Memory wire (Nitinol) activates, pulling the 'latch' mechanism away from the door groove, against its spring.
+			- Latch movement is confirmed by the 'latch' sensor (binary switch activated when latch is pulled out of the way by memory wire OR pushed out by door closure).
+			- Once the latch is disengaged, the 'ejector' lever (under spring pressure) pushes up on the door/pin, causing it to pop open.
+			- Successful door opening is confirmed when the 'ejector' lever sensor deactivates (indicating door is no longer pressing it).
+			- Display indicates unlock status.
+			- The device can use these two sensors to troubleshoot: e.g., if latch actuates but ejector sensor still indicates door closed, it signals an issue.
+		
+		#### 2.2.4 Error handling and recovery
+			- Retry on unlock failure.
+			- Display shows error details and guidance.
+			- **Retry Logic:**
+				* If the latch sensor indicates the latch actuated successfully, but the ejector sensor indicates the door remains closed, the user is prompted with a message like "Unlock mechanism operated. Please ensure the door is not blocked and can open freely."
+				* If the latch sensor indicates the latch failed to actuate, the device will retry, incrementally increasing the memory wire heating time/power with each attempt, up to a predefined safety limit.
+				* If unlock fails 5 consecutive times (due to latch actuation failure), the user is prompted to contact support.
+			- Multiple retries with adjusted timing (for latch actuation) or user guidance (for physical obstruction).
+	
+	### 2.3 Battery Life and Power
+		- Expected battery life: 1-2 months (typical usage).
+		- Standby time: Up to 6 months (locked, no interaction).
+		- Low battery warnings at 20%.
+		- Device prompts recharge if SOC is too low before initiating an unlock sequence, as the memory wire activation can cause significant voltage sag. The system is designed to prevent unlock attempts if the battery is too low to complete them safely.
+		- If the battery becomes critically low or dies while the device is locked, it will enter a deep sleep mode (e.g., STOP2). The RTC, powered by its backup battery, continues to maintain the correct time and lock duration. Upon repowering or waking, the device will restore the correct remaining lock time.
+		- Never permanently refuses unlock due to low battery once sufficient charge is available.
+		
+		#### 2.3.1 Power Parameters Requiring Validation
+			- **Note: Key power parameters require experimental validation**:
+				* Deep sleep quiescent current.
+				* Power consumption with active peripherals during sleep.
+				* LSE crystal accuracy and drift.
+				* Sleep/wake transition latency.
+				* Battery self-discharge rate.
+				* Memory wire current consumption across temperature.
+			- These measurements are essential for the power consumption model.
+
+## 3. System Architecture
+	### 3.0 Architectural Pillars
+		#### Three-Task Architecture
+			1. HardwareService_Task (Priority 5 - Highest RTOS priority): Manages all direct hardware interactions (HLM, sensors, power, storage) via the BSP. Processes requests from ApplicationLogic_Task. Stack: ~1KB. This task is critical for real-time hardware control and responsiveness.
+			2. ApplicationLogic_Task (Priority 4 - Medium RTOS priority): Handles core application logic, state machine management, lock system rules, agent AI (mood, decisions, dialog flow), and processes validated user inputs. Sends hardware requests to HardwareService_Task and UI update commands to Display_Task. Stack: ~2KB. This task is the "brains" of the application.
+			3. Display_Task (Priority 3 - Lower RTOS priority): Dedicated to all UI rendering, including screens, menus, graphics, agent character images/animations, and managing the display framebuffer. Receives high-level rendering commands from ApplicationLogic_Task. Stack: ~1.5KB. This task isolates display operations, preventing them from blocking more critical logic.
+			
+			**Rationale:** Enhanced responsiveness and robustness by separating concerns. Hardware control is isolated and highly prioritized. Core application logic is shielded from potentially time-consuming UI rendering. UI rendering can proceed without impacting critical system functions, improving perceived performance and system stability. This architecture provides a clearer structure for managing complex interactions in an event-driven system.
+			
+		#### Real-Time Operating System Foundation
+			Built on FreeRTOS. Configuration via STM32CubeMX GUI (.ioc file).
+		
+			Core RTOS Configuration:
+				* Stack overflow checking (method 2).
+				* Malloc failed hook.
+				* configASSERT enabled.
+				* Hooks in `App/Kernel/rtos_hooks.c`.
+				* MPU support utilized for enhanced task isolation and memory protection (integrated with FreeRTOS MPU port).
+		
+		#### Hardware Abstraction (Mini-BSP Layer)
+			Minimal two-file Board Support Package (BSP):
+			1. Pin Definitions (`bsp_pins.h`): Centralizes all pin/port symbolic names.
+			2. Driver Wrappers (`bsp_drivers.h/.c`): Thin inline wrappers around HAL/LL calls. All hardware access from System Components or other modules must go through this BSP layer. The BSP functions internally utilize the STM32Cube HAL/LL drivers.
+
+			**Benefits:** Consolidates hardware quirks, enables test mocking, simplifies hardware changes, separates hardware details from application logic. Hardware access is exclusively via BSP calls, not direct HAL/LL calls by System Components.
+		
+			- Stack Management:
+				* Fixed size stacks (HardwareService_Task: ~1KB, ApplicationLogic_Task: ~2KB, Display_Task: ~1.5KB).
+				* Stack usage monitoring (FreeRTOS method 2, supplemented by MPU-enforced guard regions for hardware fault detection).
+			
+			- Critical State Preservation:
+				* Essential state in retained memory during low-power modes.
+				* Recovery mechanisms for unexpected resets.
+		
+		#### Power-Aware Design
+			- RTOS idle hook manages sleep modes.
+			- FreeRTOS tickless idle (RTC wake source).
+			- Optimized task scheduling.
+			- Event-driven, minimal active time.
+	
+		#### Memory Protection Unit (MPU) for Enhanced Robustness
+			To significantly improve firmware robustness and protect against common embedded software faults, CKOS leverages the Arm Cortex-M4's Memory Protection Unit (MPU). The MPU is configured during system initialization.
+			Key MPU protections include:
+				* **Stack Overflow Protection:** For each RTOS task, a dedicated MPU region is configured as a non-writable guard band at the end of its allocated stack space. Any attempt to write into this guard region (indicative of a stack overflow) triggers an MPU fault. This provides immediate hardware-level detection of stack corruption, complementing FreeRTOS's software-based stack overflow checking (method 2).
+				* **NULL Pointer Dereference Protection:** MPU Region 0 (address 0x0, typically covering a small area like the first 32 or 256 bytes of memory) is configured with 'No Access' permissions. This prevents accidental reads, writes, or instruction fetches from the NULL address and its immediate vicinity, a common cause of system crashes.
+			MPU fault handlers are implemented (e.g., `MemManage_Handler`) to capture these exceptions. These handlers can log diagnostic information and take appropriate recovery or safety actions, aiding in debugging and preventing uncontrolled system behavior.
+
+	### 3.1 State Machine Foundation
+		#### 3.1.1 Core Design
+			- Table-driven finite state machine (maps State, Event to Handler Function Pointers).
+			- Event-driven.
+			- State transitions, event handling, guards implemented via function pointers in a state transition table.
+			- States mapped to power modes.
+		
+		#### 3.1.2 State Types
+			| State Type         | Description                                      |
+			|-------------------|--------------------------------------------------|
+			| MENU              | User navigation                                  |
+			| LOCK_SETUP        | Lock parameter configuration                     |
+			| LOCK_ACTIVE       | Active lock monitoring                           |
+			| AGENT_INTERACTION | User communication with agent                    |
+			| UNLOCK_SEQUENCE   | Physical unlock operation and verification       |
+			| ERROR             | Error handling and recovery                      |
+			| IDLE              | Low-power waiting state                          |
+		
+		#### 3.1.3 Event Processing
+			- Events queued and batch processed on wake by ApplicationLogic_Task.
+			- Critical events (e.g., from HardwareService_Task) can trigger immediate processing in ApplicationLogic_Task via high-priority RTOS task notifications.
+			- Each state defines valid event handlers in the state transition table.
+			
+		#### 3.1.4 Implementation Pattern (State Machine as an Active Object, Table-Driven)
+			Implemented as an Active Object. State handling uses a table mapping (State, Event) to function pointers for actions and transitions.
+			- State transition logic is data-driven by the table.
+			- Event handling uses function pointers in a state transition table.
+			- Owns a dedicated event queue.
+			- Orchestrates features (Agent/Game/Dialog) by triggering actions.
+			- Interactions with other Active Objects (e.g., Agent Engine) via message passing.
+	
+		#### 3.1.5 State-to-Power Mode Mapping
+			- System states map to RUN, STOP2, or STANDBY modes.
+			- State entry configures the appropriate power mode via Power Management Service.
+			- Wakeup sources (button interrupts, RTC alarms, door sensor, temperature sensor) configured based on state.
+	
+	### 3.2 Layered Software Architecture
+		#### 3.2.1 Layer Hierarchy (top to bottom)
+			1. Display_Task (Handles all UI Rendering and Animation) - Active Object, operates at a lower RTOS priority.
+				* **Responsibilities:** Exclusively responsible for all rendering to the LCD, managing the framebuffer, and executing visual effects/animations. Uses the U8g2 graphics library (via BSP driver wrappers) for all drawing primitives (text, shapes, icons). Manages a collection of "Screens" or "Views", each with a dedicated handler function for rendering and state management.
+				* Receives high-level, abstract commands from `ApplicationLogic_Task` via an RTOS message queue (e.g., "CMD_ACTIVATE_SCREEN", "CMD_UPDATE_TEXT_ELEMENT", "CMD_START_ANIMATION").
+				* Interacts with BSP for display hardware control (including U8g2 access).
+				* **Impact:** Decouples rendering from core logic, preventing UI operations from blocking application processing. Improves UI fluidity and overall system responsiveness. Centralizes rendering, leading to a cleaner UI codebase.
+			
+			2. ApplicationLogic_Task (Manages Core Logic, State Machine, Agent System, Dialog) - Active Object, operates at a medium RTOS priority.
+				* **Responsibilities:** Core state machine management, orchestrating transitions, workflow control, Lock System logic (timing, status), Agent Logic (manages agent character states, mood levels, interaction history, decision trees), Dialog Management (lookup tables for agent dialogs, influenced by agent mood).
+				* Processes validated input events (e.g., from `HardwareService_Task` via an intermediary queue or notification).
+				* Issues high-level, abstract commands to `Display_Task` via an RTOS message queue to manage UI presentation. Routes other commands/data by calling C APIs of System Component modules (which operate within its context or `HardwareService_Task`) or by sending messages/notifications to `HardwareService_Task`.
+				* Manages high-level application flow and system mode transitions.
+				* **Impact:** Centralizes application intelligence, separates it from direct hardware and rendering concerns. Facilitates complex decision-making and state management.
+
+			3. System Components (Service Modules & Features, e.g., HLM, Storage, Lock System logic operate within `ApplicationLogic_Task` or `HardwareService_Task`) - These are logical modules, not independent RTOS tasks, unless they are part of `HardwareService_Task`. They operate within the context of `ApplicationLogic_Task` or `HardwareService_Task`.
+				* Encapsulate major functionalities.
+				* Each module manages its own state and logic.
+				* **Expose functionality via direct C APIs.** API functions within `ApplicationLogic_Task` might directly call other modules in `ApplicationLogic_Task` or use RTOS primitives (`xQueueSend()`, `xTaskNotify()`) to communicate with `HardwareService_Task` or `Display_Task`. API functions within `HardwareService_Task` modules handle hardware operations.
+				* `HardwareService_Task` can broadcast events using `xTaskNotify()` to `ApplicationLogic_Task`. ISRs use `vTaskNotifyGiveFromISR()` / `xTaskNotifyFromISR()` to signal `HardwareService_Task` or `ApplicationLogic_Task` as appropriate.
+				* **Impact:** Provides a flat architecture, simplified includes, reduced message-passing code, aids debugging, and enables PC-based simulation.
+				* **System Component modules access hardware exclusively through the BSP layer (via functions within `HardwareService_Task`), which uses STM32Cube HAL/LL drivers with pin definitions from `bsp_pins.h`.**
+			
+			4. STM32Cube Hardware Abstraction Layer (HAL)
+				* Vendor-provided HAL (`Drivers/STM32L4xx_HAL_Driver/`).
+				* Standardized APIs for STM32 peripherals.
+				* Initialization (`MX_*_Init()`) configured/generated by STM32CubeMX.
+				* **Utilized internally by the BSP for hardware operations, not directly accessed by System Components.**
+	
+		#### 3.2.2 Design Principles
+			- Components interact through defined C APIs or RTOS messaging.
+			- **API-Driven Task-Based Components with Direct RTOS Primitives**: `ApplicationLogic_Task` calls C APIs of its internal System Components or uses `xQueueSend()` or `xTaskNotify()` to communicate with `HardwareService_Task` and `Display_Task`. `Display_Task` primarily receives messages. Components broadcast events via `xTaskNotify()`. ISRs signal tasks using `vTaskNotifyGiveFromISR()` or `xTaskNotifyFromISR()`. Consumer tasks might use `QueueSet`s.
+			- **Hardware Access via BSP**: System Components (within `ApplicationLogic_Task` or `HardwareService_Task`) use the BSP for all hardware interactions. The BSP internally uses STM32Cube HAL/LL drivers and `bsp_pins.h` definitions.
+			- **Message Content**: Queue messages can be simple or complex. Task notifications carry a 32-bit value.
+			- **Decoupling**: Provided by direct queue messaging and task notifications.
+			- **Serialization**: Each Active Object processes messages sequentially.
+			- **Static Allocation**: Queues and message buffers are statically allocated.
+			- **Resource Protection**: Active Object pattern protects internal data. Mutexes rare.
+			- Timeouts can be used for queue posts or expected replies.
+
+	### 3.3 Memory Management
+		#### 3.3.1 Flash Allocation
+			- Program code: ~60-65% (increased slightly due to compiled-in image assets)
+			- Assets (UI text, dialog, non-image binary assets if any): ~10% (Stored in internal flash. Image assets are compiled directly into program code.)
+			- Free headroom: 25% (for updates)
+			- Target binary size: ≤ 310 kB (may need slight adjustment based on final image asset size)
+			- EEPROM emulation: Reserved area (X-CUBE-EEP middleware) for agent moods, lock timers, total locked time counters.
+			- User data preserved during firmware updates.
+			- Binary Structure: Core firmware, Configuration. Agent image assets (e.g., PBMs converted to C arrays) are part of the core firmware binary. A separate `Agent_Assets.bin` might be used in the future for other types of assets (e.g., sound, complex animation sequences) but not for current PBM-based static images. Sections are updated as a whole via standard STM32 DFU. A custom bootloader may allow independent section updates and display bootloader status.
+		
+		#### 3.3.2 RAM Usage Strategy
+			- Static Slab Allocation: Fixed memory pools for variable-sized resources.
+				* Pools from static arrays: `static uint8_t arena[N]`.
+				* Simple `memory_pool_alloc()/free()` interface.
+				* No general-purpose `malloc/free`.
+				* Deterministic worst-case RAM usage.
+			- Display Framebuffer: A dedicated static buffer in RAM for the full display (e.g., 128x64 monochrome = 1024 bytes) managed by `Display_Task`.
+			
+			- Memory Pool Configuration (example in `memory_pools.h`):
+				```c
+				// static uint8_t display_buffer_arena[8 * 1024];
+				// DEFINE_MEMORY_POOL(display_pool, display_buffer_arena, 1024, 8);
+				```
+			
+			- FreeRTOS Configuration:
+				* `configSUPPORT_DYNAMIC_ALLOCATION = 1` (for timers/queues).
+				* FreeRTOS objects use `pvPortMalloc` (via `heap_5.c`, which can be configured to use memory regions corresponding to static slab arenas if desired, or manage its own general heap).
+				* Stack Management:
+					* Fixed size stacks (HardwareService_Task: ~1KB, ApplicationLogic_Task: ~2KB, Display_Task: ~1.5KB).
+					* Stack usage monitoring.
+			
+			- Critical State Preservation:
+				* Essential state in retained memory during low-power modes.
+				* Recovery mechanisms for unexpected resets.
+		
+		#### 3.3.3 Memory Analysis and Optimization
+			- Static Analysis: Pool sizes by worst-case, deterministic usage, no fragmentation.
+			- Memory Map Organization: Code/constants in flash, pools/variables in RAM. Pools aligned for power management.
+			- Optimization: String pooling, const-correctness, compression, compiler flags.
+				
+		#### 3.3.4 Memory Pool Usage
+			Example:
+			```c
+			// uint8_t* buffer = memory_pool_alloc(&display_pool);
+			// if (buffer) { /* use buffer */ memory_pool_free(&display_pool, buffer); }
+			// memory_pool_get_stats(&display_pool, &stats);
+			// if (stats.free_blocks < 2) { /* log warning */ }
+			```
+
+## 4. Core Systems
+	Based on the three-task architecture.
+
+	### 4.1 ApplicationLogic_Task
+		Handles core application logic, state machine, agent AI, dialog, and coordinates other tasks.
+
+		#### 4.1.1 Responsibilities
+			- **Core State Machine:** Manages system states and transitions.
+			- **Application Logic:** Implements lock timing/status, rules for different lock types, game logic integration.
+			- **Agent System:** Manages agent characters, mood, decisions, dialog flow, and interaction history.
+			- **Input Processing:** Receives validated input events (e.g., from button presses detected by HardwareService_Task).
+			- **Coordination:** Sends hardware operation requests to `HardwareService_Task` (e.g., unlock, read sensor). Issues high-level, abstract commands to `Display_Task` via an RTOS message queue to manage UI presentation (e.g., CMD_ACTIVATE_SCREEN, CMD_UPDATE_TEXT_ELEMENT, CMD_START_ANIMATION).
+			- **Hardware-Dependent State:** Manages application-level understanding of hardware state based on feedback from `HardwareService_Task`.
+
+		#### 4.1.2 ApplicationLogic API (Conceptual)
+			Message-based interactions are key, but internal organization might involve:
+			- `ApplicationLogic_Init()`
+			- `ApplicationLogic_ProcessUserInput(InputEvent* event)`
+			- `ApplicationLogic_HandleHardwareEvent(HardwareEvent* event)`
+			- Functions to trigger state transitions or agent interactions.
+			- Functions to send commands to `Display_Task` (e.g., `AppLogic_SendDisplayCommand(DisplayCommandID, void* data)`).
+			- Functions to send requests to `HardwareService_Task`.
+
+	### 4.2 Display_Task
+		Dedicated to managing all visual output on the LCD. Solely responsible for all rendering, managing the framebuffer, and executing visual effects/animations using U8g2 library (via BSP). Operates in U8g2's full framebuffer mode.
+
+		#### 4.2.1 Responsibilities
+			- **UI Rendering:** Exclusively responsible for all rendering to the LCD using U8g2 (via BSP). Draws all screens, menus, text, icons, and graphical elements to an internal full display framebuffer (e.g., 1024 bytes for 128x64 display).
+			- **Screen/View Management:** Internally manages a collection of "Screens" (or "Views"). Each Screen has a dedicated handler function within Display_Task responsible for rendering its layout and content using U8g2, processing data passed with activation commands, and managing UI element state. A registry or switch-case maps ScreenIDs to handlers. Drawing occurs in a strict, predefined order to achieve layering effects.
+			- **Reusable UI Components:** Screen handlers call self-contained drawing modules/helper functions (e.g., PIN Entry Pad, Time Selector) to render components, using data provided by ApplicationLogic_Task. These components are drawn using theme-aware parameters.
+			- **Agent Visuals & Image Handling:** Renders agent-specific images and other static graphical assets.
+				* Source images are standard ASCII PBM (P1 type) files.
+				* A build-time script converts these PBM files into U8g2-compatible C-language byte arrays (e.g., XBM format: `static const unsigned char my_image_bits[] = {...};`). These arrays are compiled directly into the firmware.
+				* `Display_Task` renders these images using U8g2 functions like `u8g2_DrawXBM()`, accessing the C arrays directly from flash.
+			- **Animation Engine:** Solely responsible for the execution of all visual animations (e.g., menu scrolling, character transitions). Manages a list of active animations, their current frame, and metadata (sprite sheet C array pointers, frame rate, looping). `ApplicationLogic_Task` commands `Display_Task` to start/stop/change animations. The engine handles frame-by-frame updates, redrawing necessary framebuffer portions. Animation timing is driven by a dedicated RTOS timer for smooth and consistent playback, signaling `Display_Task` to process animation frames.
+			- **Framebuffer Management & Partial Updates:**
+				* Manages the full internal display framebuffer (e.g., `static uint8_t display_framebuffer[1024];`). All U8g2 drawing operations target this buffer.
+				* Implements manual partial update logic. After a screen is drawn/updated into the framebuffer, `Display_Task` identifies the changed regions (e.g., by comparing with a copy of the previous frame or using dirty rectangle tracking).
+				* Instructs the BSP (via functions like `bsp_display_update_region(x, y, w, h, region_data_ptr)`) to send only these modified regions to the physical display controller. This minimizes data transfer over SPI/I2C and reduces power consumption.
+			- **Resource Handling:** Accesses compiled-in UI assets like fonts (defined as U8g2 C arrays) and image C arrays (converted from PBMs).
+			- **Theme Management:** Applies UI themes based on settings received from `ApplicationLogic_Task`. Drawing functions for UI elements and components use parameters from the active theme (e.g., fonts, border styles, foreground/background conventions for monochrome).
+
+		#### 4.2.2 Display_Task API (Conceptual - primarily message-driven)
+			Receives high-level, abstract commands via an RTOS queue from `ApplicationLogic_Task`.
+			- `Display_Init()`
+			- Expects messages like:
+				- `CMD_ACTIVATE_SCREEN { ScreenID screen_id, void* data_ptr }` (e.g., `ScreenID_LockSetup`, `LockConfigData* data`)
+				- `CMD_UPDATE_TEXT_ELEMENT { ScreenID screen_id, ElementID element_id, char* text }` (e.g., `ScreenID_Agent`, `ElementID_Dialog`, "New Agent Message")
+				- `CMD_START_ANIMATION { AnimationID animation_id, ScreenCoordinates coordinates, uint8_t loop_count }` (e.g., `AnimationID_MenuScrollLeft`, `{x,y}`, `0` for infinite)
+				- `CMD_UPDATE_STATUS_BAR { StatusBarInfo* info }`
+				- `CMD_SET_THEME { ThemeID theme_id }` // New command for theme changes
+			- Internal functions for screen handlers, U8g2 drawing wrappers (via BSP), animation steps, partial update calculation, and theme parameter application.
+
+	### 4.3 HardwareService_Task
+		Manages all direct hardware interactions and time-critical operations.
+
+		#### 4.3.1 Responsibilities
+			- **Hardware Lock Management:** Memory wire actuation (BSP PWM), door/lever switches (BSP GPIO), temperature compensation (BSP ADC).
+			- **Sensor Management:** Button debouncing (BSP GPIO) and event generation, other sensor readings (BSP ADC).
+			- **Storage Operations:** Flash R/W (BSP storage), EEPROM emulation.
+			- **Power Management:** Power modes (BSP power), sleep transitions, battery status (BSP ADC).
+
+		#### 4.3.2 Hardware Service API (message-based)
+			Message-based interface with `ApplicationLogic_Task`:
+				- `HardwareService_Init()`
+				- Receives requests like: `REQ_UNLOCK(UnlockParams* params)`, `REQ_READ_SENSORS()`, `REQ_WRITE_STORAGE(StorageOp* op)`, `REQ_SET_POWER_MODE(PowerMode mode)`.
+				- Sends notifications/events back to `ApplicationLogic_Task` like: `EVT_BUTTON_PRESS(ButtonID)`, `EVT_DOOR_STATUS(Status)`, `EVT_UNLOCK_COMPLETE(Result)`.
+			
+			All hardware access via BSP.
+
+	### 4.4 Inter-Task Communication
+		- Strict message passing (RTOS queues) and task notifications for all inter-task data exchange. No shared memory buffers without explicit RTOS synchronization primitives (generally avoided).
+		- Data is copied in messages to avoid race conditions.
+		- `ApplicationLogic_Task` sends requests to `HardwareService_Task`; `HardwareService_Task` sends results/events back.
+		- `ApplicationLogic_Task` sends high-level, abstract rendering commands to `Display_Task` via a dedicated RTOS message queue. 
+			- A `DisplayCommand` struct/enum (defined in a shared header, e.g., `display_interface.h`) encapsulates command types (e.g., `DISPLAY_CMD_SHOW_SCREEN_X`, `DISPLAY_CMD_UPDATE_TEXT_Y`, `DISPLAY_CMD_PLAY_ANIMATION_Z`) and their associated data payloads.
+			- `ApplicationLogic_Task` populates and sends these command structures (e.g., `DisplayCommand cmd = {.id = DISPLAY_CMD_SHOW_LOCK_SCREEN, .data.lock_screen_data = {...}}; xQueueSend(display_task_queue_handle, &cmd, ...);`).
+			- `Display_Task`'s main loop waits on this queue. Upon receiving a command, it invokes the appropriate internal rendering function, which utilizes U8g2 (via BSP calls like `bsp_u8g2_DrawStr()`, `bsp_u8g2_DrawXBMP()`) to update its internal framebuffer and then triggers a transfer to the physical display. This is typically a one-way communication, though `Display_Task` could signal animation completion if required.
+		- `HardwareService_Task` (e.g., from button ISRs) sends input events to `ApplicationLogic_Task`.
+		- Shared data structures requiring protection are owned by a single task; other tasks interact via API calls (if within the same task) or messages to the owner task.
+		- Mutexes should be rare due to clear ownership and message-based communication.
+			
+		**Design Rule:** One IPC primitive (queue or task notification) per primary producer/consumer pair. Message passing is the standard.
+
+	### 4.5 Hardware Lock Manager (HLM)
+		#### 4.5.1 HLM Implementation
+			Within `HardwareService_Task`. For time-critical Memory Wire PWM, HLM calls a dedicated BSP function (e.g., `bsp_pwm_set_precise()`) which internally uses STM32Cube LL drivers for direct register access (e.g., `LL_TIM_OC_SetCompareCHx()`). Other HLM interactions with hardware also occur via the BSP, which then uses STM32Cube HAL as appropriate.
+
+	### 4.6 Power Management
+		- Optimizes battery life.
+		- Implements power mode transitions via BSP calls (which use STM32Cube HAL macros like `HAL_PWREx_EnterSTOP2Mode()`).
+		- Uses FreeRTOS tickless idle. FreeRTOS uses BSP functions that wrap `HAL_SuspendTick()` / `HAL_ResumeTick()` around sleep. The SysTick is exclusively managed by FreeRTOS via HAL initialization.
+		- Handles power events. MCU monitors battery voltage via a voltage divider and ADC (via BSP). 
+			* If battery voltage drops to a defined low threshold (e.g., ~3.0V) the MCU will enter a deep sleep mode (e.g., STOP2) to conserve power. The RTC remains active to maintain accurate time. Upon wake (triggered by a button press), the device will restore its operational state, including its current lock status (locked/unlocked) and, if it was locked, the correct remaining lock duration based on the time elapsed during sleep.
+			* An external battery protection IC provides a further safeguard, disconnecting the battery at a critically low voltage to prevent cell damage. Once this IC disconnects the battery, the MCU is unpowered and the device will require charging to resume operation.
+		- USB-C port for DFU and Charging: Data pins connect to MCU for DFU. Power pins connect to a simple Li-ion charger IC. The port is only used for charging when not in DFU mode. The charger IC has a status pin connected to an MCU GPIO (via BSP) to indicate charging state.
+		- Dependencies: BSP (wrapping HAL), RTC, Task notifications, ADC, external battery protection IC, charger IC.
+
+		#### 4.6.1 Reference-Counted Sleep Suppression (Insomnia)
+			To prevent the system from entering deep sleep modes during critical operations (e.g., flash writing, precise timing), the Power Management module (within `HardwareService_Task`) implements a reference-counted sleep suppression mechanism.
+			- An atomic counter (`ckos_power_insomnia_level`, initialized to 0) tracks requests to prevent deep sleep.
+			- `ckos_power_insomnia_enter()`: Atomically increments the counter. Called before a critical operation.
+			- `ckos_power_insomnia_exit()`: Atomically decrements the counter. Called after a critical operation.
+			- The RTOS idle hook (`vPortSuppressTicksAndSleep`, likely in `rtos_hooks.c` or a power management file called by the hook) checks this counter.
+			- If `ckos_power_insomnia_level == 0`, deep sleep modes (e.g., STOP2) are permitted.
+			- If `ckos_power_insomnia_level > 0`, only light sleep (e.g., WFI instruction) is performed, keeping peripherals active.
+			- Critical HAL operations (e.g., BSP flash write, memory wire PWM burst) must call `ckos_power_insomnia_enter()` before starting and `ckos_power_insomnia_exit()` upon completion.
+			
+	### 4.7 Time Management System
+		The device employs a robust timekeeping strategy to ensure accuracy for lock durations and user display, centered around UTC.
+
+		#### 4.7.1 Core Principles
+			- **Internal Time Standard:** All internal timekeeping, lock scheduling, event logging, and duration calculations are based on Coordinated Universal Time (UTC). The RTC is maintained in UTC.
+			- **Display Time:** The time displayed to the user is derived from the internal UTC time by applying the user-selected timezone offset and Daylight Saving Time (DST) adjustment.
+			- **Timezone and DST Configuration:** The device stores user-configurable settings for their local timezone (represented as an offset from UTC, e.g., UTC-5, UTC+2) and a boolean DST flag (active/inactive). These settings are persisted.
+
+		#### 4.7.2 Time Setting and Adjustment
+			- **Initial Time Source:** The UTC time can be set during the first-time configuration process or may be set as part of a firmware update procedure.
+			- **Unlocked State Adjustment:** When the device is unlocked, the user has full control to:
+				* Set the current date and UTC time.
+				* Modify the timezone offset.
+				* Toggle the DST status.
+			- **Locked State Adjustment:** When the device is locked, to prevent any manipulation of ongoing lock durations, users can only modify:
+				* The timezone offset.
+				* The DST status.
+				Changing these values while locked only affects the displayed time and does not alter the underlying UTC time or the actual unlock moment of an active lock.
+			- **RTC Synchronization:** All adjustments to the system time are synchronized with the hardware Real-Time Clock (RTC).
+
+		#### 4.7.3 Implementation Details
+			- **Time Representation:** Time is stored and manipulated internally as a UTC timestamp (e.g., seconds since a specific epoch).
+			- **Timezone Offset:** The timezone is stored as a signed integer representing the offset in minutes or hours from UTC.
+			- **DST Logic:** The DST flag acts as a simple +1 hour adjustment if active, applied after the timezone offset when calculating local display time. The device does not automatically calculate DST periods based on region or date; it relies on the user to set the DST flag appropriately.
+			- **User Interface:** The UI provides clear mechanisms for setting UTC time (when unlocked) and for selecting timezone offset and DST status.
+
+## 5. Hardware Integration
+	### 5.0 Key Hardware Components
+		Initialization and low-level control via STM32CubeMX generated code and STM32Cube HAL, which are then wrapped and managed by the BSP.
+
+		#### 5.0.1 RTC (Real-Time Clock)
+			- Core timekeeper, battery-backed (maintained in UTC). Calendar, periodic wake-up alarms.
+			- Hardware: 32.768 kHz external crystal, backup domain, multiple alarms, sub-second precision.
+			
+		#### 5.0.2 Memory Wire and Lock Mechanism
+			- Shape memory alloy wire, contracts when heated (70°C threshold).
+			- Zero power when idle, physical memory behavior.
+			- Mechanical design: 
+				* Latch: Engages with the door. A spring normally keeps it in the latched position. The memory wire pulls the latch to unlatch. A binary sensor detects latch position (engaged/disengaged).
+				* Ejector: A spring-loaded lever that pushes the door open once the latch is disengaged. A binary sensor detects if the door/pin is present (pressing the ejector).
+			- Memory wire resets when cooled; the latch spring ensures the latch returns to its default position, ready for re-locking.
+			- Specs: 0.1mm diameter, up to 300g pull, 1-3s recovery.
+		
+		#### 5.0.4 Input System
+			- D-pad + A/B buttons. Processed by centralized **Sensors Module** (debouncing, event generation).
+			- Hardware: Tactile switches, pull-ups, interrupt-capable GPIOs.
+			- Firmware debouncing: Configurable per button, interrupt-driven, software timer validation.
+		
+		#### 5.0.5 Display
+			- 128x64 monochrome transflective LCD, white LED back-light. Low power, partial update.
+			- Interface: SPI/I²C, 3.3V logic.
+			- Module: Integrated controller (e.g., SSD1306), on-chip RAM, programmable contrast.
+			
+		#### 5.0.6 Sensor System
+			- Lock sensors: 
+				* Latch position sensor (binary switch).
+				* Ejector / Door presence sensor (binary switch).
+			- Temperature sensor, battery voltage monitoring.
+			- Types: Mechanical microswitches, thermistor/digital temp sensor, battery voltage via ADC (through BSP).
+			- Characteristics: Switches 100k+ cycles, Temp accuracy ±1°C, Battery sensing ±0.05V.
+	
+	### 5.1 Firmware-Hardware Interface (BSP Wrapping STM32Cube HAL/LL)
+		System Components make calls to the BSP, which then uses STM32Cube HAL/LL with pin definitions from `bsp_pins.h`. Direct HAL/LL calls from System Components are not permitted.
+
+		#### 5.1.1 STM32Cube Hardware Abstraction Layer (HAL)
+			- **Role:** Provides a standardized interface to MCU peripheral registers (`Drivers/STM32L4xx_HAL_Driver/`). It is used by the BSP to implement hardware control functions.
+			- **Scope:** All STM32 peripherals.
+			- **Initialization:** `MX_*_Init()` functions generated by STM32CubeMX.
+			- **Access:** Utilized by the BSP, not directly by System Components.
+
+		#### 5.1.2 Sensor Interface (BSP Access)
+			- Digital inputs (buttons, switches) managed by Sensors Module (uses BSP for GPIO/ISR, which in turn uses HAL).
+			- Analog/complex digital sensors interfaced directly by System Components using BSP functions (for ADC, I2C, SPI), which then call appropriate HAL drivers.
+			- Example: `HLM_ReadTemperatureInCelsius()` calls a BSP function like `bsp_adc_read_temp()`, which then calls `HAL_ADC_Start()` and `HAL_ADC_GetValue()`.
+			- Door/Lock Sensing: Managed by Sensors Module. It uses BSP functions for EXTI ISRs and GPIO reads for the latch and ejector sensors. The BSP internally uses HAL (e.g., `HAL_GPIO_ReadPin()`).
+
+		#### 5.1.3 Memory Wire Control (BSP Access)
+			- HLM System Component controls wire actuation via BSP calls (e.g., `bsp_pwm_start()`, `bsp_gpio_write()`). The BSP then uses HAL calls (e.g., `HAL_TIM_PWM_Start()`, `HAL_GPIO_WritePin()`).
+			- For precise PWM updates, the HLM task uses a specific BSP function (e.g., `bsp_pwm_set_precise_compare()`), which internally uses STM32Cube LL drivers (e.g., `LL_TIM_OC_SetCompareCH1()`).
+			- PWM/GPIOs configured by CubeMX. Both HAL/LL timer drivers must be generated for BSP use.
+
+		#### 5.1.4 Display Interface (BSP Access)
+			- UI System (`Display_Task`) controls the display. It uses U8g2 for all drawing operations into an internal RAM framebuffer.
+			- `Display_Task` then calls BSP functions (e.g., `bsp_display_update_region(x, y, w, h, data_ptr)`) to send specific, modified regions of its framebuffer to the display controller via SPI/I2C. The BSP handles the low-level communication (e.g., `HAL_SPI_Transmit()`).
+			- This approach enables efficient partial updates. The BSP might also provide functions for full screen updates if needed (e.g., `bsp_display_refresh_full(framebuffer_ptr)`).
+			- Display initialization (e.g., `bsp_display_init()`) is handled by the BSP.
+
+		#### 5.1.5 Power Management Interface (BSP Access)
+			- Hardware Power Modes controlled via BSP calls (e.g., `bsp_enter_stop2_mode()`), which then use HAL calls (e.g., `HAL_PWREx_EnterSTOP2Mode()`).
+			- Manages SysTick via BSP functions that wrap `HAL_SuspendTick()`/`HAL_ResumeTick()` as needed by FreeRTOS.
+			
+			- Hardware Wakeup Capabilities: EXTI, RTC, PVD, IWDG, Temp sensor thresholds, DMA.
+			
+			- Power HAL Responsibilities: Configure modes, handle transitions, manage clock tree, configure wake sources, control peripheral power domains.
+
+		#### 5.1.6 STM32CubeMonitor-Power Integration
+			- Used for detailed live current capture and analysis.
+
+	### 5.2 Critical Hardware Interactions
+		#### 5.2.1 Unlock Sequence
+			Critical timed sequence, orchestrated by the HLM module within `HardwareService_Task` via BSP calls:
+				1. `bsp_pwm_config_and_start()` (configure and start PWM for memory wire).
+				2. `bsp_gpio_write_pin()` (enable memory wire power circuit).
+				3. Temperature-compensated timing delay for wire heating.
+				4. `bsp_gpio_read_pin()` (monitor latch sensor to confirm movement).
+				5. `bsp_gpio_read_pin()` (monitor ejector sensor for door opening).
+				6. `bsp_gpio_write_pin()` (disable wire circuit).
+				7. Notify Application Logic (within `ApplicationLogic_Task`) of success or failure.
+			
+			- Error handling (managed by HLM): Overcurrent detection (if hardware supports), timeout cutoff for wire heating, retry logic (see Section 2.2.4), user notification via `ApplicationLogic_Task`.
+		
+		#### 5.2.2 Power Transition Management
+			- Considerations: RTC preserved, GPIOs wake-capable, display content static, memory retention.
+			- Timing constraints: Exit timing, sequenced wake-up, voltage scaling.
+
+## 6. Implementation Details
+	### 6.1 State Machine Structure
+		#### 6.1.1 State Organization
+			- Defined in C enumeration.
+			- Organized by functional area.
+			- Transitions, guards, actions are implemented in handler functions, which are mapped in a central state transition table (e.g., `StateEventTable[currentState][event] = &handler_function;`).
+			- The state machine logic runs within `ApplicationLogic_Task`, which retrieves events from its queue, looks up the current state and event in the table, and calls the corresponding handler function.
+		
+		#### 6.1.2 Core States for Physical Operation
+			Setup States: Initial config, Time setting.
+			Lock Initiation States: Lock config, Waiting for door closure, Lock confirmation.
+			Active Lock States: Lock monitoring, Time display, Agent interaction (if LOCK_TYPE_AGENT).
+			Unlock Sequence States: Unlock initiation, Wire activation, Unlock verification, Error handling, Door open waiting.
+			
+		#### 6.1.3 Event Processing
+			Events: UI (buttons), Timer (RTC, timeouts), Sensor (door, lever, temp), System (power, errors).
+			Critical path events: Door state, wire timing, lever position, battery critical.
+			Event queue processed in state-machine task loop.
+	
+		#### 6.1.4 State Machine Table Generation
+			- States/events in CSV/JSON.
+			- Python script (`Tools/generate_state_table.py`) autogenerates `state_machine_table.c/.h`.
+			- Eliminates manual switch editing, reduces errors, diff-friendly.
+
+	### 6.2 Component Implementation References
+		Each major Module has a dedicated design document:
+		- UI System: "UI System Design Document" (This system is managed by `Display_Task` for rendering and animation, receiving commands from `ApplicationLogic_Task`. Responsibilities include power-efficient display updates via manual partial updates of a full RAM framebuffer, management of compiled-in image assets (PBM source, converted to XBM C arrays at build time), layered rendering through strict drawing order, a widget toolkit utilizing theme parameters, Image Provider logic for accessing compiled-in image C arrays, separation of logic/assets, U8g2 for graphics, agent character-specific image/animation display using a dedicated RTOS timer for animation, UI themes with parameterized drawing, flexible duration input component, menu scrolling animations).
+			- **Reusable UI Components planned (Rendered by `Display_Task` using theme parameters, logic driven by `ApplicationLogic_Task`):**
+				- `PIN Entry Pad`: Navigable on-screen grid for numeric input, supporting selection (A button) and deletion (B button).
+				- `Flexible Time/Duration Selector`: Component for selecting time units (minutes, hours, days, years) and values.
+				- `Menu System`: Displays a central interactive option with visual cues (e.g., side arrows) for scrolling to other options, including animations for transitions.
+				- `Agent Interaction Selector`: List-based menu for presenting dialog or action choices when interacting with an agent.
+				- `Confirmation Screens`: Standardized layout for displaying messages, statuses (e.g., after key usage), and calls to action.
+				- `Identicon Display Element`: Renders the 5x5 Identicon for Keyholder lock connection visualization.
+				- `Key Entry Screen`: A screen optimized for entering various key types (unlock, cleaning, config) which might be alphanumeric. Rendered by `Display_Task`.
+		- Lock System Module: "Lock System Design Document" (Handles lock state, time tracking including total locked times per lock type and current session lock time, security, exceptions, management of lock time not accruing during 'cleans'/brief unlocks where door remains closed, and management of Cleaning/Break feature rules. This logic resides within `ApplicationLogic_Task`.)
+		- Game System Module: "Game System Design Document" (Mini-games for lock time modification, skill-based or luck-based. Logic managed by `ApplicationLogic_Task`, display elements by `Display_Task`. Agent can offer games; Custom mode allows user selection/configuration of games).
+
+	### 6.3 System Initialization Sequence
+			1. Hardware Initialization (CubeMX Generated, then wrapped by BSP): `HAL_Init()`, Clock Config. FreeRTOS will manage SysTick via HAL initialization (typically `HAL_InitTick()` is called within `HAL_Init()`). `MX_*_Init()` for all peripherals used by the BSP.
+			   a. Early MPU Configuration: Initial MPU setup for NULL pointer protection (Region 0 set to No Access) and basic memory layout. The MPU is enabled.
+			2. RTOS Initialization (CubeMX Generated & Kernel): FreeRTOS kernel init. If using an MPU-enabled FreeRTOS port, this includes further MPU configuration for task stack guarding and memory region definitions for the kernel and tasks. Tasks (`HardwareService_Task`, `ApplicationLogic_Task`, `Display_Task`), semaphores/queues/timers/mutexes created. `FreeRTOSConfig.h` settings, including configuration for `heap_5.c`. Custom RTOS hooks (`App/Kernel/rtos_hooks.c`).
+			3. System Component Initialization: Error handling framework, `_Init()` API calls for System Components (Storage, HLM, Sensors, Power Management - primarily within `HardwareService_Task` or initialized by it. Lock System, Agent System logic initialized within `ApplicationLogic_Task`. UI elements/resources initialized by `Display_Task`). All components use BSP for hardware access where relevant.
+			4. Application Logic Initialization: State machine setup within `ApplicationLogic_Task`, persistent config load, user settings restore, first-run wizard if needed.
+
+## 7. Development Guidelines
+	### 7.1 Implementation Patterns
+		#### 7.1.1 Code Consistency Requirements
+			- Lock types implement the full Lock interface.
+			- Agent implementations require complete dialog sets (managed within `ApplicationLogic_Task`) and associated image assets (PBMs, converted to XBM C arrays and compiled in).
+			- State functions handle all possible events (within `ApplicationLogic_Task`).
+			- UI elements work with strict drawing order for layering and use theme parameters for styling (managed by `Display_Task`).
+			- Tasks follow FreeRTOS patterns for STM32.
+			- Hardware access is exclusively via the BSP layer (which uses STM32 HAL/LL internally).
+			- No abstraction layers for portability outside STM32L4 without sign-off.
+			- Implementations are kept as simple as possible; features align with the documented design unless explicitly noted and approved.
+			
+		#### 7.1.2 Common Implementation Patterns
+			- Task-based concurrency (Active Object pattern for `HardwareService_Task`, `ApplicationLogic_Task`, `Display_Task`).
+			- State machines: Table-driven (map of [State, Event] to Handler Function Pointers), primarily within `ApplicationLogic_Task`.
+			- Feature selection: compile-time preprocessor definitions.
+			- Hardware access: Exclusively via the BSP, which uses STM32Cube HAL/LL (from Service Active Objects).
+			- Persistent storage: key-value system (via Storage Active Object).
+			- Event logging: SWV ITM channels.
+	
+	### 7.2 Programming Guidelines
+		Naming conventions: Types = UpperCamel, Functions = snake_case, Macros = UPPER_SNAKE.
+		
+		#### 7.2.1 Power-Aware Programming
+			- Minimize ISR computation.
+			- Minimize display updates (commanded by `ApplicationLogic_Task`, executed by `Display_Task`).
+			- Leverage RTOS idle hook for sleep.
+			- Compute only when necessary.
+			- Use the API of the Power Management module (within `HardwareService_Task`) for power-related decisions and state transitions. `ApplicationLogic_Task` requests power mode changes.
+		
+		#### 7.2.2 Memory Efficiency
+			- Use memory pools for variable-sized data.
+			- Monitor pool usage.
+			- Clear memory on free.
+			- Stack allocation for small temporary buffers.
+			- Avoid recursion/deep call stacks.
+			- Align pools to SRAM bank boundaries.
+			- No dynamic allocation outside pool system.
+		
+		#### 7.2.3 Layer Separation Rules
+			- Strict layer separation. `ApplicationLogic_Task` interacts with System Components (which operate in its context or `HardwareService_Task`) via C APIs or messages. `ApplicationLogic_Task` sends commands to `Display_Task`. System Components use the BSP for all hardware interactions. The BSP uses HAL/LL.
+			- All user text is conceptually managed by `ApplicationLogic_Task` (e.g., via Dialog System) and sent to `Display_Task` for rendering.
+			- Task communication via RTOS queues or task notifications.
+
+		#### 7.2.4 IPC Consistency
+			- One IPC primitive (queue or notify) per producer/consumer pair.
+			- Use common helpers for IPC.
+
+		#### 7.2.5 Mockable Modules
+			- Module interface via dedicated *.h.
+			- Internal helpers declared with `STATIC_MOCKABLE` macro (allows unit test override).
+
+		#### 7.2.6 Strong Types for Units
+			- Typedefs for time/energy units (e.g., `ms_t`, `mAh_t`).
+			- No raw numeric types for these in APIs.
+
+	### 7.3 Quality Assurance
+		#### 7.3.1 Static Analysis
+			- Mandatory: STM32CubeIDE's MISRA C/C++ checking and Clang-Tidy.
+			- Warnings/results exported in CI. Custom MISRA-C:2012 subset.
+			- Integrated in CI: Pre-commit hooks, full analysis on PRs, nightly deep analysis.
+			- Focus: Memory safety, RTOS safety, power management, interrupt safety, type safety.
+			- Policy: Zero tolerance for critical issues, warning review for merge.
+			- Code Coverage: STM32CubeIDE Pro built-in coverage plugin (MC/DC).
+
+		#### 7.3.2 Testing Strategy
+			- Unit testing (Unity, host-side).
+			- Interface contract testing.
+			- Integration testing (host-side logic, FFF mocks for HAL/LL). Firmware built/flashed with CubeIDE.
+			- Hardware-in-the-loop testing (STM32L4).
+			- Power consumption validation (CubeIDE Energy-Profile wizard).
+			
+			- Initial CI Coverage Targets: 70% line for core logic, 50% overall project. Focus on boundary conditions, error paths, critical functions.
+			
+			- Implementation: Tests mirror source, FFF mocks, automated CI execution, performance regression.
+			
+			- Specialized suites: Power profiles, temperature compensation, long-term reliability, UI responsiveness.
+
+		#### 7.3.3 Simplified Debugging
+			- Conditional debug output (`LOG()` macro, SWO/UART). Severity levels, build-time filtering.
+			- STM32CubeIDE Debug Features: Live Expressions, RTOS Awareness, SWV ITM tracing.
+			- On-device logging disabled in production.
+
+		#### 7.3.4 Code Review Requirements
+			- Checklist: Static analysis, test coverage, power impact, RTOS analysis, interface compatibility.
+			- Focus: Task safety, power management, error handling, resource utilization.
+
+## 8. File Structure
+    ### 8.1 Project Organization
+        • ProjectRoot/
+            • STM32Keeper.ioc
+            • README.md / CHANGELOG.md / .gitignore / CI-scripts …
+            • Core/                            # (CubeMX auto-generated)
+            • Drivers/                         # (CubeMX auto-generated STM32L4 CMSIS & HAL/LL)
+            • Middlewares/
+                • FreeRTOS/Source/
+            • App/                             # (Hand-written firmware)
+                • Config/                      # .h files for system, features, power, lock, memory_pools, ui_themes
+                • Kernel/                      # rtos_hooks.c/.h, task_table.c/.h, memory_pool.c/.h
+                • BSP/                         # bsp_pins.h, bsp_drivers.h/.c
+                • AppLogic/                    # (app_logic.c/.h, state_machine.c/.h, lock.c/.h, agent.c/.h)
+                • Display/                     # display.c/.h (handles rendering, animations, partial updates, image C array access, themes)
+                    • Assets/                  # (Contains C arrays for fonts, and compiled-in image assets generated from PBMs)
+                • Hardware/                    # hardware_service.c/.h, hlm.c/.h, sensors.c/.h, storage.c/.h, power.c/.h
+                • Utils/                       # crc16, ring_buffer, logging
+            • Assets_Src/                      # Source assets before conversion
+                • Images/                      # Contains source PBM image files (e.g., agent_angry.pbm)
+                • Fonts/                       # Source font files if any (e.g. BDF before conversion to U8g2 C array)
+            • Tests/
+                • Unit/
+                • Integration/
+                • Mocks/
+            • Tools/
+                • Scripts/                     # e.g., generate_error_codes.py, convert_pbm_to_c_array.py
+                • CMake/ or Make/
+
+## Appendix D - Open Validation Items
+    ### D.1 Power Consumption Measurements
+        (Validate with CubeIDE Energy-Profile wizard and direct measurements)
+        - Deep sleep quiescent current.
+        - Power consumption with active peripherals during sleep.
+        - LSE crystal accuracy and drift.
+        - Sleep/wake transition latency.
+        - Battery self-discharge rate.
+        - Memory wire current consumption.
+        - Idle current: tickless idle vs. traditional SysTick.
+    
+    ### D.2 Timing Parameters
+        - Memory wire temperature coefficients.
+        - Flash erase/write times.
+        - Peripheral wake-up times from STOP2.
+        - RTC accuracy over temperature.
+        - UI responsiveness state transition times.
+        - Tickless idle: task scheduling accuracy and impact of LSE drift.
+    
+    ### D.3 Operational Thresholds
+        - Battery voltage thresholds.
+        - Temperature thresholds for normal operation.
+        - Retry counts for physical actuation.
+        - Max current draw during unlock.
+        - Safe temperature limits for memory wire.
+
+Flash Protection Features:
+- STM32L4 flash protection (RDP, WRP, PCROP) intentionally not enabled (RDP Level 0).
+- Ensures users have complete control and unrestricted firmware access.
+- Physical unlock required for firmware updates aligns with right-to-repair.
+
+Bootloader Configuration:
+- STM32L4 built-in DFU bootloader is used. Firmware is updated as a single binary.
+- Boot config: nBOOT0/nBOOT1 for main flash boot. DFU via internal physical button. No software DFU entry (nSWBOOT0=1).
+- Update Process: Physical unlock to access DFU button. STM32CubeProgrammer for flashing. No firmware authentication/signing.
+- A custom bootloader is planned to enable display of bootloader status and potentially independent update of firmware sections (e.g., core vs. assets).
+- The firmware update process via DFU can also be used to set/update the device's current UTC time, ensuring accuracy post-update.

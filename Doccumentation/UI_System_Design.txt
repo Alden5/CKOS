@@ -1,0 +1,881 @@
+# CKOS UI System Design Document
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document provides a detailed design for the UI System of the CKOS firmware, primarily focusing on the implementation of the `Display_Task` and its interactions with `ApplicationLogic_Task`. It elaborates on the UI-related architectural elements described in `Doccumentation/architecture.txt` and serves as a blueprint for developers implementing the CKOS user interface.
+
+### 0.2 Scope
+The scope of this document includes:
+- The internal architecture of `Display_Task`.
+- Management and rendering of screens/views.
+- Implementation of reusable UI components.
+- The animation engine within `Display_Task`.
+- The partial display update mechanism.
+- Integration and management of UI assets (images, fonts).
+- The UI theme engine.
+
+This document aligns with the overall system architecture defined in `Doccumentation/architecture.txt`, particularly sections 3.0 (Architectural Pillars), 4.2 (`Display_Task`), 4.4 (Inter-Task Communication), 3.3 (Memory Management), and 6.2 (UI System under Component Implementation References).
+
+### 0.3 Definitions and Acronyms
+- **UI:** User Interface
+- **BSP:** Board Support Package
+- **XBM:** X Bitmap (image format)
+- **PBM:** Portable Bitmap (image format)
+- **IPC:** Inter-Task Communication
+- **RTOS:** Real-Time Operating System
+- **HAL:** Hardware Abstraction Layer
+- **LL:** Low-Layer (Drivers)
+- **ST7565R:** LCD Controller model for the target display.
+
+## 1. `Display_Task` Architecture
+
+As outlined in `Doccumentation/architecture.txt` (section 3.0), `Display_Task` is one of the three core tasks, operating at a lower RTOS priority (Priority 3) and dedicated to all UI rendering. It isolates display operations, preventing them from blocking more critical logic. All display updates are full-frame updates; partial update mechanisms are not used to simplify implementation.
+
+### 1.1 Internal State Management
+`Display_Task` needs to manage its internal state to correctly render the UI and handle animations.
+
+#### 1.1.1 Key State Variables
+```c
+typedef struct {
+    ScreenID current_screen_id;         // Identifier for the currently active screen/view
+    bool is_display_active;           // Indicates if the display is currently powered or in a sleep state
+    // The g_current_theme (see Section 7.1) also forms part of the global display state.
+    // Add other global display states, e.g., brightness, contrast if managed here
+} DisplayTask_State_t;
+
+// Global instance of Display_Task state
+static DisplayTask_State_t g_display_state;
+
+// For active animations, see Section 4.1 Animation Engine Data Structures
+```
+- `current_screen_id`: An enumeration `ScreenID` (e.g., `SCREEN_ID_MAIN_MENU`, `SCREEN_ID_LOCK_SETUP`, `SCREEN_ID_AGENT_INTERACTION`) will define all possible screens.
+- `is_display_active`: Could be used in conjunction with power management to avoid drawing operations when the display is off.
+
+#### 1.1.2 State Transitions
+State transitions (e.g., changing `current_screen_id`) are primarily driven by commands received from `ApplicationLogic_Task` via its message queue. For instance, a `CMD_ACTIVATE_SCREEN` command will update `g_display_state.current_screen_id` and trigger the rendering of the new screen.
+
+### 1.2 Message Queue Processing
+`Display_Task` receives high-level, abstract commands from `ApplicationLogic_Task` via an RTOS message queue, as specified in `Doccumentation/architecture.txt` (sections 4.2.1, 4.2.2, 4.4).
+
+#### 1.2.1 Queue Definition
+A dedicated RTOS queue (`display_task_queue_handle`) is used. The definition and initialization are part of the RTOS setup. Message structures should be defined in a shared header (e.g., `display_interface.h`), as alluded to in `Doccumentation/architecture.txt` (section 4.4).
+
+#### 1.2.2 Command Structure
+A generic command structure could be:
+```c
+// Forward declaration for payload union
+typedef union DisplayCommandPayload_u DisplayCommandPayload_t;
+
+typedef enum {
+    CMD_ACTIVATE_SCREEN,
+    CMD_START_ANIMATION,
+    CMD_STOP_ANIMATION,
+    CMD_SET_THEME,
+    CMD_DISPLAY_REFRESH,      // Force a full redraw of the current screen using Display_Task's current data
+    // ... other command IDs
+} DisplayCommandID_t;
+
+typedef struct {
+    ScreenID screen_id;
+    void* screen_specific_data; // Pointer to data structure specific to the screen
+                                // ApplicationLogic_Task is responsible for lifetime of this data if passed by pointer,
+                                // or Display_Task must copy it. Data copying is preferred (Arch. 4.4)
+} ActivateScreenPayload_t;
+
+// typedef struct { // Deprecated in favor of full screen data updates via CMD_ACTIVATE_SCREEN
+//     ScreenID screen_id;         // Optional, could be implicit (current screen)
+//     uint32_t element_id;        // Unique ID for the element within the screen
+//     char* text;                 // Pointer to text. Display_Task should copy this if needed.
+// Max length conventions must be established.
+// } UpdateTextElementPayload_t;
+
+// typedef struct { // Deprecated
+//     ScreenID screen_id;         // Optional
+//     uint32_t element_id;
+//     void* element_data;         // Pointer to generic data for the element
+// } UpdateGenericElementPayload_t;
+
+
+// Forward definition for AnimationType_t (defined in Section 4.1)
+typedef enum AnimationType_e AnimationType_t;
+
+// Payload for starting tween animations, part of StartAnimationPayload_t
+typedef struct {
+    float start_value;
+    float end_value;
+    // EasingFunctionID_t easing_function; // Optional: Could be part of AnimationDefinition_t or specified here
+                                        // For now, assume AnimationDefinition_t defines easing or defaults to linear.
+} StartTweenAnimationSpecificPayload_t;
+
+// Union for animation type specific payloads within StartAnimationPayload_t
+union DisplayAnimationTypeSpecificPayload_u {
+    // No specific payload for XBM if coords are top-level in StartAnimationPayload_t
+    // and XBM data is from AnimationDefinition_t
+    StartTweenAnimationSpecificPayload_t tween_params;
+};
+typedef union DisplayAnimationTypeSpecificPayload_u DisplayAnimationTypeSpecificPayload_t;
+
+typedef struct {
+    AnimationID animation_id;
+    AnimationType_t type;           // Helps AnimationEngine_Start interpret type_specific_payload
+    ScreenCoordinates_t coordinates; // Top-left for XBMs; context-dependent for tweens (e.g., origin or ignored)
+    uint8_t loop_count;             // 0 for infinite
+    DisplayAnimationTypeSpecificPayload_t type_specific_payload;
+} StartAnimationPayload_t;
+
+typedef struct {
+    AnimationID animation_id;
+} StopAnimationPayload_t;
+
+typedef struct {
+    ThemeID theme_id;
+} SetThemePayload_t;
+
+// Removed DisplayPartialUpdatePayload_t as partial updates are not used.
+
+
+union DisplayCommandPayload_u {
+    ActivateScreenPayload_t activate_screen;
+    // UpdateTextElementPayload_t update_text_element; // Deprecated
+    // UpdateGenericElementPayload_t update_generic_element; // Deprecated
+    StartAnimationPayload_t start_animation;
+    StopAnimationPayload_t stop_animation;
+    SetThemePayload_t set_theme;
+    // DisplayPartialUpdatePayload_t partial_update; // Removed
+    // ... other payloads
+};
+
+typedef struct {
+    DisplayCommandID_t command_id;
+    DisplayCommandPayload_t payload;
+} DisplayCommand_t;
+```
+The `Inter_Task_Communication_ICD.txt` document will be the definitive source for these structures. `ApplicationLogic_Task` is responsible for populating and sending `DisplayCommand_t` messages.
+
+For updates to UI elements within a screen (e.g., new text for a label, changed state for a reusable component), `ApplicationLogic_Task` will update its comprehensive data structure for the entire active screen and then send a **`CMD_ACTIVATE_SCREEN`** command. This command uses the *same* `screen_id` as the currently active screen but provides a `screen_specific_data` pointer to the *new, updated data structure*. This ensures `Display_Task` always performs a deep copy of the complete and consistent data snapshot for the current view into its own memory pool.
+The `CMD_DISPLAY_REFRESH` command instructs `Display_Task` to perform a full redraw of the currently active screen using its *existing internal copy* of the screen data, without receiving or copying new data.
+The commands `CMD_UPDATE_TEXT_ELEMENT` and `CMD_UPDATE_GENERIC_ELEMENT` have been deprecated to simplify state management and ensure data consistency.
+
+#### 1.2.3 Processing Logic
+`Display_Task`'s main loop will pend on `display_task_queue_handle`.
+```c
+// Pseudocode for Display_Task main loop
+void Display_Task_Run(void* argument) {
+    Display_Task_Init_HW(); // Initialize display hardware via BSP
+    Display_Task_Init_Internal(); // Initialize internal state, U8g2, etc.
+
+    DisplayCommand_t received_command;
+    for (;;) {
+        if (xQueueReceive(display_task_queue_handle, &received_command, portMAX_DELAY) == pdPASS) {
+            // Process received_command
+            switch (received_command.command_id) {
+                case CMD_ACTIVATE_SCREEN:
+                    Display_Handle_ActivateScreen(&received_command.payload.activate_screen);
+                    break;
+                // case CMD_UPDATE_TEXT_ELEMENT: // Deprecated
+                // Display_Handle_UpdateTextElement(&received_command.payload.update_text_element);
+                // break;
+                // ... other cases
+                case CMD_START_ANIMATION:
+                    AnimationEngine_Start(&received_command.payload.start_animation);
+                    break;
+                case CMD_DISPLAY_REFRESH:
+                    Display_RenderCurrentScreen(); // Redraw with current data
+                    break;
+                // ...
+            }
+            // After processing most commands, a screen update is likely needed.
+            // This could be optimized to only update if the command modified visual content.
+            if (CommandRequiresRedraw(received_command.command_id)) {
+                 Display_PerformFullUpdate(); // This will handle full update logic
+            }
+        }
+    }
+}
+```
+The `Display_PerformFullUpdate()` function will then orchestrate rendering to the internal framebuffer and transferring it to the physical display using a full buffer send.
+
+### 1.3 U8g2 Library Integration
+`Display_Task` uses the U8g2 graphics library for all drawing primitives, via BSP driver wrappers, as stated in `Doccumentation/architecture.txt` (section 4.2).
+
+#### 1.3.1 Initialization
+- `Display_Task` will initialize U8g2 during its startup sequence. This involves:
+    - Calling a BSP function (e.g., `bsp_u8g2_init()`) which sets up the U8g2 structure (`u8g2_t`).
+    - The BSP function will configure U8g2 with the appropriate communication callbacks (SPI/I2C via HAL/LL) and pin configurations (`bsp_pins.h`).
+    - U8g2 will be configured for full framebuffer mode (`Doccumentation/architecture.txt` section 4.2).
+```c
+// Example U8g2 instance, managed by Display_Task, potentially initialized by BSP
+static u8g2_t g_u8g2;
+
+// In Display_Task_Init_Internal() or similar
+// bsp_u8g2_init(&g_u8g2, U8G2_R0, bsp_u8g2_gpio_and_delay_stm32, bsp_u8g2_byte_hw_spi_stm32);
+// u8g2_InitDisplay(&g_u8g2);
+// u8g2_SetPowerSave(&g_u8g2, 0); // Wake up display
+// u8g2_ClearBuffer(&g_u8g2); // Clear internal U8g2 buffer
+// u8g2_SendBuffer(&g_u8g2);  // Send to physical display (or use partial update later)
+```
+The BSP wrappers (`bsp_u8g2_gpio_and_delay_stm32`, `bsp_u8g2_byte_hw_spi_stm32`) are crucial for abstracting hardware details from U8g2 and `Display_Task`.
+
+#### 1.3.2 BSP Wrapper Usage
+All drawing operations will use U8g2 functions (e.g., `u8g2_DrawStr`, `u8g2_DrawBox`, `u8g2_DrawXBM`) invoked on the `g_u8g2` instance. These calls draw to U8g2's internal framebuffer.
+`Doccumentation/architecture.txt` (section 4.2.1) mentions BSP wrappers for U8g2 access. This implies that direct calls to `u8g2_*` functions might be wrapped by BSP functions like `bsp_u8g2_DrawStr(&g_u8g2, ...)`. However, U8g2 itself is a hardware abstraction. The primary role of the BSP here is to provide the low-level `u8x8_display_info_t`, `u8x8_cad_cb`, and `u8x8_gpio_and_delay_cb` callbacks for U8g2 initialization, and to manage the transfer of the U8g2 framebuffer to the actual display hardware.
+
+The BSP's role for U8g2 is:
+1.  Provide hardware-specific callbacks for U8g2 `u8x8_SetGPIOReset`, `u8x8_SetCD`, etc.
+2.  Provide the byte-level and GPIO/delay communication functions for SPI/I2C.
+3.  Initialize the display controller (e.g., SSD1306) via U8g2 setup.
+4.  Provide functions like `bsp_display_update_region()` or `bsp_display_send_buffer()` which take data from U8g2's buffer (or `Display_Task`'s copy) and send it to the screen.
+
+`Display_Task` directly uses U8g2 APIs for drawing into the U8g2 framebuffer. The BSP is primarily involved in setting up U8g2 with the correct hardware interface functions and then transferring the rendered buffer to the screen.
+
+### 1.4 Framebuffer Management
+As per `Doccumentation/architecture.txt` (section 4.2.1), `Display_Task` manages a full internal display framebuffer. U8g2 itself maintains a framebuffer when operating in full buffer mode.
+
+#### 1.4.1 Structure and Allocation
+- The U8g2 library, when configured for full framebuffer mode (e.g., `U8G2_ST7565_ERC12864_F_4W_HW_SPI` for the specified ST7565R controller), internally allocates memory for its framebuffer. For a 128x64 monochrome display, this is 1024 bytes (128 * 64 / 8).
+- This buffer is typically allocated statically within the U8g2 library structure or as a global/static array passed to U8g2. `Display_Task` doesn't need a separate `static uint8_t display_framebuffer[1024];` as U8g2's internal buffer is directly used.
+- No "previous frame" buffer is required as partial updates are not implemented.
+```c
+// U8g2's internal buffer is used directly. No separate g_previous_framebuffer is needed.
+```
+
+#### 1.4.2 Drawing Order and Layering
+`Doccumentation/architecture.txt` (section 4.2.1) states: "Drawing occurs in a strict, predefined order to achieve layering effects."
+This is managed by `Display_Task`'s screen handler functions (see Section 2). Each screen handler is responsible for:
+1.  Clearing the relevant part of the U8g2 buffer (or the whole buffer: `u8g2_ClearBuffer(&g_u8g2);`).
+2.  Drawing background elements first.
+3.  Drawing mid-ground elements.
+4.  Drawing foreground elements (e.g., pop-ups, cursors, status indicators).
+5.  Drawing active animations on top if necessary.
+
+The order of calls to `u8g2_*` drawing functions within a screen handler dictates the layering. There's no explicit "layer" system in U8g2 beyond this procedural drawing order.
+
+## 2. Screen/View Implementation Guide
+
+`Display_Task` manages a collection of "Screens" or "Views", each with a dedicated handler function for rendering and state management, as per `Doccumentation/architecture.txt` (section 4.2.1).
+
+### 2.1 Structure for Screen Handler Functions
+Screen handlers are C functions within `Display_Task` responsible for rendering a specific screen.
+
+#### 2.1.1 Signature
+A common signature should be used:
+```c
+// Screen-specific data passed from ApplicationLogic_Task
+typedef void ScreenData_t; // Generic pointer, actual type varies per screen
+
+// Screen handler function pointer type
+typedef void (*ScreenHandler_Render_fp)(u8g2_t* u8g2, const ScreenData_t* data);
+typedef void (*ScreenHandler_ProcessInput_fp)(const InputEvent_t* input_event, ScreenData_t* data); // If Display_Task handles some UI state logic
+
+// Structure to hold screen information
+typedef struct {
+    ScreenID id;
+    ScreenHandler_Render_fp render_func;
+    // ScreenHandler_ProcessInput_fp process_input_func; // If needed
+    // Other screen-specific metadata, e.g., default theme
+} Screen_Definition_t;
+```
+However, `Doccumentation/architecture.txt` implies `ApplicationLogic_Task` processes validated inputs and sends display commands. So, screen handlers primarily focus on rendering based on data.
+
+A simpler `render_func` might be:
+```c
+// Called when a screen needs to be drawn or redrawn
+// The `data` parameter is the screen-specific data payload from the CMD_ACTIVATE_SCREEN command
+typedef void (*ScreenHandler_Render_fp)(u8g2_t* p_u8g2, const void* screen_specific_data);
+```
+
+#### 2.1.2 Activation and Registry
+- A `CMD_ACTIVATE_SCREEN` command from `ApplicationLogic_Task` will trigger a screen change.
+- `Display_Task` maintains a registry (e.g., an array of `Screen_Definition_t` or a switch-statement) to map `ScreenID` to its corresponding handler function.
+```c
+// In Display_Task:
+static ScreenHandler_Render_fp g_current_screen_render_handler = NULL;
+static const void* g_current_screen_data = NULL;
+
+void Display_Handle_ActivateScreen(const ActivateScreenPayload_t* payload) {
+    g_display_state.current_screen_id = payload->screen_id;
+
+    // Free previous screen data from the pool if it exists
+    if (g_current_screen_data_buffer_ptr) {
+        memory_pool_free(&g_display_task_memory_pool, g_current_screen_data_buffer_ptr);
+        g_current_screen_data_buffer_ptr = NULL;
+        g_current_screen_data = NULL;
+    }
+
+    // Deep copy screen_specific_data if provided
+    // It is CRITICAL that GetScreenSpecificDataSize is robust and accurately reflects the true size
+    // of the data structure for the given screen_id. Mismatches can lead to buffer overflows
+    // or data corruption. This function should ideally be table-driven or auto-generated from
+    // a central definition of screen data structures to minimize human error.
+    if (payload->screen_specific_data) {
+        size_t data_size = GetScreenSpecificDataSize(payload->screen_id); // This function must be implemented robustly,
+                                                                     // ideally table-driven (e.g., a static array mapping ScreenID to data size)
+        if (data_size > 0) {
+            g_current_screen_data_buffer_ptr = memory_pool_alloc(&g_display_task_memory_pool, data_size);
+            if (g_current_screen_data_buffer_ptr) {
+                memcpy(g_current_screen_data_buffer_ptr, payload->screen_specific_data, data_size);
+                g_current_screen_data = g_current_screen_data_buffer_ptr; // Point to Display_Task's own copy
+            } else {
+                // Memory allocation failed! Critical error.
+                g_current_screen_data = NULL;
+                Display_Handle_ScreenDataCopyError(); // Transition to system error screen
+                return; // Do not proceed with normal screen activation
+            }
+        } else if (data_size == 0) {
+            // No data needs to be copied for this screen, screen_specific_data might be NULL or non-NULL but irrelevant.
+            g_current_screen_data = NULL; 
+        } else {
+            // GetScreenSpecificDataSize returned an invalid size (e.g. negative, or an error occurred determining size)
+            // This case should ideally not happen if GetScreenSpecificDataSize is robust.
+            g_current_screen_data = NULL;
+            Display_Handle_ScreenDataCopyError(); // Transition to system error screen
+            return;
+        }
+    } else {
+        // No screen_specific_data provided in payload (e.g. for system error screen or screens without data)
+        g_current_screen_data = NULL;
+    }
+
+    switch (payload->screen_id) {
+        case SCREEN_ID_MAIN_MENU:
+            g_current_screen_render_handler = ScreenHandler_MainMenu_Render;
+            break;
+        case SCREEN_ID_PIN_ENTRY:
+            g_current_screen_render_handler = ScreenHandler_PinEntry_Render;
+            break;
+        // ... other screens
+        default:
+            g_current_screen_render_handler = ScreenHandler_Error_Render; // Fallback
+            g_current_screen_data = NULL;
+            break;
+    }
+    // Schedule a full redraw for the new screen
+    Display_RenderCurrentScreen();
+    Display_PerformFullUpdate();
+}
+
+// Called by Display_PerformFullUpdate or when a refresh is needed
+void Display_RenderCurrentScreen(void) { // Removed full_redraw_hint
+    if (g_current_screen_render_handler) {
+        u8g2_ClearBuffer(&g_u8g2); // Always clear entire U8g2 buffer before drawing new screen
+        
+        // Screen handler draws to U8g2 buffer
+        g_current_screen_render_handler(&g_u8g2, g_current_screen_data);
+
+        // Active XBM animations are drawn on top by the Animation Engine
+        // Tweened property animations are queried and applied by components themselves during their render.
+        AnimationEngine_RenderAllActiveXBMs(&g_u8g2);
+    }
+}
+```
+
+### 2.2 Receiving and Processing Screen-Specific Data
+- Data is passed from `ApplicationLogic_Task` within the `CMD_ACTIVATE_SCREEN` command's payload (`screen_specific_data` field).
+- `Display_Task` performs a deep copy of this data into its own managed memory. This is achieved using a dedicated memory pool (`g_display_task_memory_pool`) within `Display_Task`. `Display_Task` allocates memory from this pool for the incoming screen data, copies the data, and stores a pointer to this internal copy. When the screen is changed or `Display_Task` shuts down, this memory is freed back to the pool.
+- This approach aligns with `Doccumentation/architecture.txt` (section 4.4) preferring data copying for IPC, ensuring `Display_Task` is decoupled from `ApplicationLogic_Task`'s memory management for screen content.
+- If memory allocation from the pool fails during the copy, `Display_Task` will transition to a predefined system error screen (see Section 2.1.2.1 Error Handling).
+- Each screen handler must know the expected structure of `screen_specific_data` (now pointed to by `g_current_screen_data` which is Display_Task's copy) for its `ScreenID`.
+
+Example:
+```c
+// For a hypothetical Lock Status Screen
+typedef struct {
+    char keyholder_name[32];
+    uint32_t time_remaining_seconds;
+    bool is_penalty_active;
+    // Example: if a progress bar is animated for time_remaining
+    // float time_progress_bar_width; // This would be updated by querying animation engine
+} LockStatusScreenData_t;
+
+// ApplicationLogic_Task prepares and sends:
+// LockStatusScreenData_t data = {"Key Master", 3600, false};
+// cmd.payload.activate_screen.screen_id = SCREEN_ID_LOCK_STATUS;
+// cmd.payload.activate_screen.screen_specific_data = &data; // Or a copy
+// xQueueSend(display_task_queue_handle, &cmd, ...);
+
+// Screen Handler in Display_Task:
+void ScreenHandler_LockStatus_Render(u8g2_t* p_u8g2, const void* screen_data_untyped) {
+    // screen_data_untyped points to Display_Task's internal copy of the data (from the memory pool)
+    const LockStatusScreenData_t* data = (const LockStatusScreenData_t*)screen_data_untyped;
+
+    // Example: Querying an animated value for a progress bar
+    // float animated_progress_width = DEFAULT_PROGRESS_WIDTH; // Default or from 'data'
+    // if (AnimationEngine_GetAnimatedValue(ANIM_ID_LOCK_PROGRESS, &animated_progress_width)) {
+    //     // Use animated_progress_width for drawing the progress bar
+    // }
+
+    // Use data->keyholder_name, data->time_remaining_seconds to draw
+    // u8g2_DrawStr(p_u8g2, 0, 10, data->keyholder_name);
+    // ...
+}
+```
+
+### 2.3 Managing UI Element State within Screen Handlers
+- **Primary State Source:** `ApplicationLogic_Task` is the primary source of truth for UI element state that is tied to application logic (e.g., current PIN entered, selected menu item that drives logic). It sends comprehensive screen data via commands like `CMD_ACTIVATE_SCREEN` (or a similar full-refresh command) to `Display_Task` whenever the UI needs to reflect a new state.
+- **Transient/Visual State:** Some purely visual state (e.g., a blinking cursor, highlight on a button during a hold-press before `ApplicationLogic_Task` confirms action) might be managed transiently by `Display_Task` if it improves responsiveness and doesn't affect core logic. This should be minimized to keep `Display_Task` focused on rendering the state provided by `ApplicationLogic_Task`.
+- `Doccumentation/architecture.txt` (section 4.2.1) states screen handlers call "self-contained drawing modules/helper functions... using data provided by `ApplicationLogic_Task`." This reinforces that `ApplicationLogic_Task` provides the complete data snapshot for the screen to be rendered.
+
+If a screen handler needs to manage internal visual sub-states (e.g., current focus within a complex static screen that doesn't directly map to application logic state), these would be part of the screen handler's static variables or a screen-specific context structure within `Display_Task`. However, any state that `ApplicationLogic_Task` needs to be aware of or that drives application behavior must originate from `ApplicationLogic_Task`'s data.
+Example: A settings screen might have multiple fields. `ApplicationLogic_Task` would determine which field has focus, update its comprehensive data structure for the settings screen accordingly, and then send this updated data to `Display_Task`. `Display_Task` then renders the highlight based on this provided data.
+
+## 3. Reusable UI Component Implementation (within `Display_Task`)
+
+`Doccumentation/architecture.txt` (sections 4.2.1 and 6.2) lists planned reusable UI components. These are "self-contained drawing modules/helper functions" within `Display_Task`. They are rendered as part of a screen handler's drawing sequence, using data and theme parameters.
+
+General principles:
+- Each component is a collection of drawing functions.
+- They take `u8g2_t* p_u8g2`, coordinates, component-specific data, and theme parameters as input.
+- They draw directly into the U8g2 buffer provided by the calling screen handler.
+
+### 3.1 PIN Entry Pad
+- **Description:** A navigable on-screen grid for numeric input.
+- **Data from `ApplicationLogic_Task` (via screen-specific data or `CMD_UPDATE_GENERIC_ELEMENT`):**
+    ```c
+    typedef struct {
+        char current_pin_buffer[MAX_PIN_DIGITS + 1];
+        uint8_t highlighted_digit_or_action; // e.g., 0-9, PIN_ACTION_DEL, PIN_ACTION_OK.
+                                             // It is recommended to use constants or an enum for actions.
+        uint8_t num_digits_entered;
+        // Potentially bool is_invalid_pin_attempt; for visual feedback
+    } PinEntryPadData_t;
+    ```
+- **Drawing Logic (`Component_PinPad_Draw`):**
+    - Takes `u8g2_t* p_u8g2`, `x`, `y`, `const PinEntryPadData_t* data`, `const Theme_t* theme`.
+    - Draws the grid of numbers (0-9), Delete ('DEL'), and Confirm ('OK') buttons.
+    - Uses `data->highlighted_digit_or_action` to draw a visual highlight (e.g., inverted box) around the selected item.
+    - Displays `data->current_pin_buffer` in a designated area (e.g., as asterisks or actual digits).
+    - Applies theme for font, highlight style.
+- **Internal State (Visual/Transient within `Display_Task`):** Minimal. `ApplicationLogic_Task` drives the `highlighted_digit_or_action` and `current_pin_buffer` based on validated D-Pad inputs. `Display_Task` just renders this state.
+- **Responding to Translated Input:** `ApplicationLogic_Task` receives raw button presses, translates them into navigation/selection for the PIN pad, updates its comprehensive data structure for the current screen (which includes `PinEntryPadData_t`), and sends a command (e.g., `CMD_ACTIVATE_SCREEN` or a dedicated refresh command) to `Display_Task` to re-render the screen. `Display_Task` then calls the screen handler, which in turn calls the component's drawing function with the new data.
+- **Theme Application:** Uses `theme->font_primary`, `theme->style_flags` (e.g., for highlight).
+
+### 3.2 Flexible Time/Duration Selector
+- **Description:** Component for selecting time units (minutes, hours, days, years) and values.
+- **Data from `ApplicationLogic_Task` (as part of the overall screen data):**
+    ```c
+    typedef struct {
+        uint16_t years;
+        uint8_t days;
+        uint8_t hours;
+        uint8_t minutes;
+        uint8_t focused_field; // e.g., TIME_FIELD_YEARS, TIME_FIELD_DAYS.
+                               // It is recommended to use constants or an enum for field types.
+        // Min/max limits per field if needed for validation feedback
+    } TimeDurationSelectorData_t;
+    ```
+- **Drawing Logic (`Component_TimeDurationSelector_Draw`):**
+    - Takes `u8g2_t* p_u8g2`, `x`, `y`, `const TimeDurationSelectorData_t* data`, `const Theme_t* theme`.
+    - Draws labels and current values for years, days, hours, minutes.
+    - Highlights the `data->focused_field`.
+    - May include visual cues for increment/decrement if `ApplicationLogic_Task` indicates this.
+- **Internal State (Visual/Transient):** None. `ApplicationLogic_Task` controls `focused_field` and values via the screen's comprehensive data.
+- **Responding to Translated Input:** As with PIN pad, `ApplicationLogic_Task` updates the screen's comprehensive data and triggers a screen refresh/redraw in `Display_Task`.
+- **Theme Application:** Font, highlight style.
+
+### 3.3 Menu System
+- **Description:** Displays a central interactive option with visual cues for scrolling, as per `Doccumentation/architecture.txt` (section 2.1.2, 6.2).
+- **Data from `ApplicationLogic_Task` (as part of the overall screen data):**
+    ```c
+    #define MAX_MENU_ITEM_TEXT_LEN 20
+    typedef struct {
+        char text[MAX_MENU_ITEM_TEXT_LEN];
+        // Potentially an icon ID or XBM pointer
+        // bool is_enabled;
+    } MenuItem_t;
+
+    typedef struct {
+        const MenuItem_t* items; // Array of menu items
+        uint8_t num_items;
+        uint8_t selected_item_index;
+        bool show_scroll_up_arrow;
+        bool show_scroll_down_arrow;
+        // float scroll_offset_pixels; // Removed: If smooth scrolling animation is handled,
+                                     // the component will query the Animation Engine for the current offset.
+    } MenuSystemData_t;
+    ```
+- **Drawing Logic (`Component_MenuSystem_Draw`):**
+    - Takes `u8g2_t* p_u8g2`, `x`, `y`, `width`, `height`, `const MenuSystemData_t* data`, `const Theme_t* theme`.
+    - Draws the `data->items[data->selected_item_index]` text (and icon) centrally.
+    - If a scroll animation (property tween) is active for this menu (e.g., `ANIM_ID_MENU_SCROLL_OFFSET`),
+      it queries `AnimationEngine_GetAnimatedValue(ANIM_ID_MENU_SCROLL_OFFSET, &current_scroll_offset)`
+      and uses `current_scroll_offset` to adjust the drawing positions of menu items to create the visual scrolling effect.
+    - Draws side arrows if `data->show_scroll_up_arrow` or `data->show_scroll_down_arrow` are true.
+- **Internal State (Visual/Transient):** Minimal. The animation state (like `current_scroll_offset`) is managed by the Animation Engine.
+- **Responding to Translated Input:** `ApplicationLogic_Task` updates `selected_item_index` in its screen data structure and triggers either a screen redraw (for an instant change) or commands a scroll animation (e.g., `CMD_START_ANIMATION` with type `ANIM_TYPE_PROPERTY_TWEEN`, `animation_id = ANIM_ID_MENU_SCROLL_OFFSET`, and appropriate start/end values for the scroll) to `Display_Task`.
+- **Theme Application:** Font, arrow styles.
+
+## 4. Animation Engine Implementation
+
+The Animation Engine is solely responsible for executing all visual animations within `Display_Task`, as per `Doccumentation/architecture.txt` (section 4.2.1). This includes both XBM frame-by-frame animations and property tweening animations (e.g., for smooth scrolling, fading, or value changes).
+
+### 4.1 Data Structures
+```c
+typedef enum AnimationType_e { // Renamed from AnimationType_t to avoid conflict if defined elsewhere
+    ANIM_TYPE_XBM_FRAMES,       // For sprite-sheet like animations using XBM C arrays
+    ANIM_TYPE_PROPERTY_TWEEN    // For smooth transitions of a single numerical property (e.g., position, size, alpha, scroll offset)
+} AnimationType_t;
+
+typedef enum {
+    ANIM_LOOP_NONE,
+    ANIM_LOOP_COUNT,
+    ANIM_LOOP_INFINITE
+} AnimationLoopType_t;
+
+typedef enum {
+    EASING_LINEAR,
+    // Future: EASING_QUAD_IN_OUT, EASING_SINE_IN_OUT, etc.
+} EasingFunctionID_t;
+
+typedef struct {
+    AnimationID id;                         // Unique ID for this animation type/instance
+    AnimationType_t type;
+    uint16_t duration_ms;                   // Total duration for tweens; per-frame duration for XBMs
+    AnimationLoopType_t loop_type;
+
+    union {
+        struct { // Parameters for ANIM_TYPE_XBM_FRAMES
+            const uint8_t* const* xbm_frames; // Array of pointers to XBM C arrays for each frame
+            uint8_t frame_width;
+            uint8_t frame_height;
+            uint8_t total_frames;
+        } xbm;
+        struct { // Parameters for ANIM_TYPE_PROPERTY_TWEEN
+            // Start/end values are dynamic, provided by CMD_START_ANIMATION payload.
+            // This definition describes the nature of the tween.
+            EasingFunctionID_t easing_function; // Default to EASING_LINEAR if not specified or feature not implemented
+            // uint32_t target_property_id; // Optional: If a generic tween definition can target various properties.
+                                         // For now, AnimationID is assumed to be specific enough to imply the target property.
+        } tween;
+    } params;
+} AnimationDefinition_t;
+
+// Static array of all animation definitions, ROM-based
+// extern const AnimationDefinition_t g_all_animation_definitions[];
+// extern const uint8_t NUM_ANIMATION_DEFINITIONS;
+
+#define MAX_ACTIVE_ANIMATIONS 5 // System-wide limit on concurrent animations
+
+typedef struct {
+    bool is_active;
+    const AnimationDefinition_t* definition;
+    AnimationID anim_id_runtime; // Store the runtime ID for easier lookup by components
+
+    // State for XBM animations
+    ScreenCoordinates_t position;           // Top-left corner to draw XBM animation
+    uint8_t current_frame_index;
+    uint32_t last_frame_time_ms;            // Timestamp of when last XBM frame was shown or tween value last calculated
+    uint8_t loops_remaining;                // For ANIM_LOOP_COUNT (applies to both types)
+
+    // State for Property Tween animations
+    float start_value;                      // Initial value for the tween
+    float end_value;                        // Target value for the tween
+    float current_tween_value;              // Current interpolated value
+    uint32_t animation_start_time_ms;       // System time when the tween animation started
+} ActiveAnimation_t;
+
+// Pool of active animation slots
+static ActiveAnimation_t g_active_animations[MAX_ACTIVE_ANIMATIONS];
+```
+
+### 4.2 Frame-by-Frame Update Logic and Rendering Integration
+The Animation Engine's primary role is to update the state of active animations (current XBM frame or current tweened value). Rendering of these animations is handled differently based on type:
+-   **XBM Animations:** Drawn directly by the Animation Engine onto the U8g2 buffer after the main screen content has been rendered.
+-   **Property Tween Animations:** The Animation Engine calculates the `current_tween_value`. UI Components or Screen Handlers that are affected by a tween animation are responsible for querying the Animation Engine for this value (using the `AnimationID`) and applying it during their own drawing sequence.
+
+Animation state is updated by `Display_HandleAnimationTick()`, which is called in `Display_Task` context, signaled by an RTOS timer.
+
+**Updating Animation State (`Display_HandleAnimationTick` - conceptual):**
+For each active animation in `g_active_animations`:
+1.  `current_tick_time_ms = GetCurrentTimeMs();`
+2.  If `definition->type == ANIM_TYPE_XBM_FRAMES`:
+    *   If `(current_tick_time_ms - last_frame_time_ms) >= definition->duration_ms` (duration_ms is per-frame here):
+        *   Increment `current_frame_index`.
+        *   Handle looping:
+            *   If `current_frame_index >= definition->params.xbm.total_frames`:
+                *   If `loop_type == ANIM_LOOP_INFINITE`, reset `current_frame_index = 0`.
+                *   If `loop_type == ANIM_LOOP_COUNT`: Decrement `loops_remaining`. If `> 0`, reset `current_frame_index = 0`. Else, stop animation.
+                *   Else (`ANIM_LOOP_NONE`), stop animation.
+        *   Update `last_frame_time_ms = current_tick_time_ms`.
+        *   Schedule a display update.
+3.  If `definition->type == ANIM_TYPE_PROPERTY_TWEEN`:
+    *   `elapsed_time_ms = current_tick_time_ms - animation_start_time_ms;`
+    *   If `elapsed_time_ms >= definition->duration_ms` (duration_ms is total duration here):
+        *   `current_tween_value = end_value;` // Snap to end
+        *   Handle looping:
+            *   If `loop_type == ANIM_LOOP_INFINITE`: Reset `animation_start_time_ms = current_tick_time_ms`, `current_tween_value = start_value`.
+            *   If `loop_type == ANIM_LOOP_COUNT`: Decrement `loops_remaining`. If `> 0`, reset `animation_start_time_ms = current_tick_time_ms`, `current_tween_value = start_value`. Else, stop animation.
+            *   Else (`ANIM_LOOP_NONE`), stop animation.
+    *   Else:
+        *   Calculate `progress = (float)elapsed_time_ms / definition->duration_ms;`
+        *   Apply easing function (e.g., linear: `current_tween_value = start_value + (end_value - start_value) * progress;`).
+    *   Update `last_frame_time_ms = current_tick_time_ms`. // Could be used to see if value changed significantly
+    *   Schedule a display update.
+4.  If any animation state changed and requires redraw, call `Display_PerformFullUpdate()`.
+
+
+**Drawing XBM Animation Frames:**
+```c
+// Part of AnimationEngine_RenderAllActiveXBMs()
+void AnimationEngine_DrawXBMFrame(u8g2_t* p_u8g2, const ActiveAnimation_t* anim) {
+    if (!anim || !anim->is_active || anim->definition->type != ANIM_TYPE_XBM_FRAMES ||
+        !anim->definition->params.xbm.xbm_frames ||
+        !anim->definition->params.xbm.xbm_frames[anim->current_frame_index]) {
+        return;
+    }
+
+    // Each frame is its own XBM.
+    u8g2_DrawXBM(p_u8g2, anim->position.x, anim->position.y,
+                  anim->definition->params.xbm.frame_width, anim->definition->params.xbm.frame_height,
+                  anim->definition->params.xbm.xbm_frames[anim->current_frame_index]);
+}
+
+void AnimationEngine_RenderAllActiveXBMs(u8g2_t* p_u8g2) { // Renamed for clarity
+    for (int i = 0; i < MAX_ACTIVE_ANIMATIONS; ++i) {
+        if (g_active_animations[i].is_active && g_active_animations[i].definition->type == ANIM_TYPE_XBM_FRAMES) {
+            AnimationEngine_DrawXBMFrame(p_u8g2, &g_active_animations[i]);
+        }
+    }
+}
+```
+
+**Querying Tweened Values by Components:**
+UI Components or Screen Handlers that need to use an animated property value will query the animation engine.
+```c
+// Conceptual function to be implemented in AnimationEngine
+// bool AnimationEngine_GetAnimatedValue(AnimationID animation_id, float* out_value) {
+//     for (int i = 0; i < MAX_ACTIVE_ANIMATIONS; ++i) {
+//         if (g_active_animations[i].is_active &&
+//             g_active_animations[i].anim_id_runtime == animation_id &&
+//             g_active_animations[i].definition->type == ANIM_TYPE_PROPERTY_TWEEN) {
+//             *out_value = g_active_animations[i].current_tween_value;
+//             return true; // Value found and is active
+//         }
+//     }
+//     return false; // No active tween animation with this ID
+// }
+```
+
+### 4.3 RTOS Timer Integration
+- **Starting:**
+    - `AnimationEngine_Start(const StartAnimationPayload_t* payload)`:
+        - Find an inactive slot in `g_active_animations`.
+        - Find `AnimationDefinition_t` by `payload->animation_id`.
+        - Initialize the `ActiveAnimation_t` slot:
+            - `is_active = true`, `definition` pointer, `anim_id_runtime = payload->animation_id`.
+            - `loop_count = payload->loop_count`.
+            - If `payload->type == ANIM_TYPE_XBM_FRAMES`:
+                - `position = payload->coordinates`.
+                - `current_frame_index = 0`, `last_frame_time_ms = GetCurrentTimeMs()`.
+            - If `payload->type == ANIM_TYPE_PROPERTY_TWEEN`:
+                - `start_value = payload->type_specific_payload.tween_params.start_value`.
+                - `end_value = payload->type_specific_payload.tween_params.end_value`.
+                - `current_tween_value = start_value`.
+                - `animation_start_time_ms = GetCurrentTimeMs()`, `last_frame_time_ms = GetCurrentTimeMs()`.
+        - If using per-animation timers, create and start it. (If single timer, it will pick it up).
+- **Stopping:**
+    - `AnimationEngine_Stop(AnimationID anim_id)`:
+        - Find the active animation by `anim_id`.
+        - Mark `is_active = false`.
+        - If using per-animation timer, stop and delete it. (Not applicable with single system timer).
+        - Stopping an animation means it will not be drawn in the next rendering pass.
+        - If the animation's visual elements need to be explicitly cleared from the screen immediately (rather than waiting for the next natural screen redraw over that area), `ApplicationLogic_Task` should command a screen refresh (e.g., `CMD_DISPLAY_REFRESH`) after stopping the animation.
+- **Modifying:** Less common. Could involve changing speed (adjusting `duration_ms` which implies recalculating progress for tweens or changing frame rate for XBMs) or tween target values. Would require new command types and careful state management within `ActiveAnimation_t`.
+
+## 5. Partial Update Mechanism Implementation (REMOVED)
+
+This section has been removed. The system uses full display updates only.
+`Display_Task` will render the complete UI to the U8g2 internal framebuffer. After all drawing operations for a frame are complete (including screen handlers and XBM animations), `Display_Task` will call a BSP function like `bsp_display_send_buffer(&g_u8g2)` to transfer the entire content of the U8g2 framebuffer to the ST7565R display controller.
+
+This simplifies the rendering pipeline by eliminating the need to track changed regions or maintain a copy of the previous frame. The trade-off is potentially higher data transfer over SPI/I2C for each update, but this is acceptable given the decision to simplify.
+
+The main update function, previously `Display_ScheduleUpdate()`, is now effectively `Display_PerformFullUpdate()`:
+```c
+void Display_PerformFullUpdate(void) {
+    // 1. Ensure the U8g2 buffer is up-to-date (Display_RenderCurrentScreen should have been called if content changed)
+    // Display_RenderCurrentScreen(); // This might be called earlier by the command handler.
+
+    // 2. Send the entire U8g2 buffer to the physical display via BSP
+    bsp_display_send_buffer(&g_u8g2);
+}
+```
+The call to `Display_RenderCurrentScreen()` populates the `g_u8g2` buffer. Then `Display_PerformFullUpdate()` sends this buffer.
+
+## 6. Asset Integration (Implementation Details)
+
+UI assets (images, fonts) are compiled into the firmware, as per `Doccumentation/architecture.txt` (sections 3.3.1, 4.2.1).
+
+### 6.1 Accessing and Rendering Compiled C Arrays
+
+#### 6.1.1 XBM Images
+- Source images are PBM (P1 ASCII), converted by `convert_pbm_to_c_array.py` to XBM C arrays (e.g., `static const unsigned char my_image_bits[] = {...};`).
+- These arrays are stored in Flash (part of `.rodata`).
+- `Display_Task` (via screen handlers or components) renders them using `u8g2_DrawXBM(&g_u8g2, x, y, width, height, my_image_bits);`.
+- Naming conventions (e.g., `g_xbm_agent_happy`) should be followed. The `Assets/` directory within `App/Display/` is specified in `Doccumentation/architecture.txt` (section 8.1).
+
+#### 6.1.2 U8g2 Fonts
+- Source fonts (e.g., BDF) are converted to U8g2 C array format.
+- These are also stored in Flash.
+- `Display_Task` sets fonts using `u8g2_SetFont(&g_u8g2, u8g2_font_xxxx);`.
+- The chosen font is then used by subsequent `u8g2_DrawStr()`, etc. calls.
+- Font C arrays are also placed in `App/Display/Assets/`.
+
+### 6.2 Memory Considerations
+- All assets (XBMs, fonts) contribute to Flash memory usage. `Doccumentation/architecture.txt` (section 3.3.1) allocates ~10% for assets and targets ≤ 310 kB binary size.
+- Asset sizes should be monitored. Optimization strategies:
+    - Use smaller fonts where possible.
+    - Optimize images (e.g., reduce dimensions, use RLE compression if U8g2/custom drawing supports it - U8g2 XBM is uncompressed).
+    - Ensure PBMs are strictly monochrome and efficiently packed by the conversion script.
+- RAM impact is minimal for assets themselves, as they are in Flash. Framebuffers are the main RAM consumers for UI.
+
+## 7. Theme Engine Implementation
+
+`Display_Task` applies UI themes based on settings received from `ApplicationLogic_Task`, as per `Doccumentation/architecture.txt` (section 4.2.1). The theming system is designed to allow significant visual changes, including switching between text-based and graphical representations for certain elements.
+
+Initially, two themes will be supported:
+1.  **`THEME_ID_BASIC`**: Focuses on clear, text-based presentation of information. Animations and complex graphics might be simplified or replaced with textual equivalents.
+2.  **`THEME_ID_ADVANCED`**: Leverages graphical assets (icons, images, complex animations) for a richer user experience. (This theme will be more fully developed later).
+
+Themes affect the overall presentation. "Premade elements" or fundamental U8g2 drawing primitives (e.g., `u8g2_DrawBox`, `u8g2_DrawStr`) are not changed in their core behavior by themes; rather, the theme dictates *whether* and *how* these primitives are used by components and screen handlers to construct the UI. For example, a status indicator might be drawn as text in `THEME_ID_BASIC` but as an XBM icon in `THEME_ID_ADVANCED`.
+
+### 7.1 Data Structure Design for Themes
+The `Theme_t` structure needs to capture parameters that allow for these different presentation styles.
+```c
+typedef enum {
+    THEME_ID_BASIC,
+    THEME_ID_ADVANCED,
+    // ... other themes can be added later
+    NUM_THEMES
+} ThemeID_t;
+
+typedef enum {
+    THEME_PRESENTATION_STYLE_TEXT_ONLY,
+    THEME_PRESENTATION_STYLE_GRAPHICAL
+    // Potentially more granular styles can be added
+} ThemePresentationStyle_t;
+
+typedef enum {
+    HIGHLIGHT_STYLE_INVERT,         // Swap foreground/background for highlight
+    HIGHLIGHT_STYLE_BORDER,         // Draw a border around the highlighted element
+    // ... other highlight styles
+} HighlightStyle_t;
+
+typedef struct {
+    ThemeID id;
+    ThemePresentationStyle_t presentation_style; // Key differentiator for Basic vs. Advanced
+
+    // Common visual parameters
+    const uint8_t* font_primary;        // U8g2 font pointer (e.g., u8g2_font_ncenB08_tr)
+    const uint8_t* font_secondary;      // Optional secondary font
+    uint8_t default_draw_color;       // U8g2 color index for drawing (typically 1)
+    uint8_t background_color;         // U8g2 color index for background (typically 0)
+
+    // Styling for specific UI patterns
+    HighlightStyle_t list_item_highlight_style;
+    uint8_t highlight_border_color;     // Color if highlight_style uses a border
+
+    // Other theme-specific parameters can be added:
+    // e.g., bool use_icons_for_status;
+    // e.g., const xbm_t* arrow_up_icon; (if theme dictates specific icons)
+
+} Theme_t;
+
+// Global array of defined themes, ROM-based
+// extern const Theme_t g_system_themes[NUM_THEMES];
+// Example definitions (likely in App/Config/ui_themes.c):
+/*
+const Theme_t g_system_themes[NUM_THEMES] = {
+    [THEME_ID_BASIC] = {
+        .id = THEME_ID_BASIC,
+        .presentation_style = THEME_PRESENTATION_STYLE_TEXT_ONLY,
+        .font_primary = u8g2_font_helvR08_tr, // Example: a clear, readable font
+        .font_secondary = u8g2_font_5x7_tr,
+        .default_draw_color = 1,
+        .background_color = 0,
+        .list_item_highlight_style = HIGHLIGHT_STYLE_INVERT,
+        .highlight_border_color = 1,
+    },
+    [THEME_ID_ADVANCED] = {
+        .id = THEME_ID_ADVANCED,
+        .presentation_style = THEME_PRESENTATION_STYLE_GRAPHICAL,
+        .font_primary = u8g2_font_helvB08_tr, // Example: Bolder Helvetica 8px
+        .font_secondary = u8g2_font_profont11_mr,
+        .default_draw_color = 1,
+        .background_color = 0,
+        .list_item_highlight_style = HIGHLIGHT_STYLE_BORDER, // e.g., a box around selected items
+        .highlight_border_color = 1,
+        // .use_icons_for_status = true,
+        // .arrow_up_icon = g_xbm_arrow_up_stylish,
+    },
+};
+*/
+
+// Pointer to the currently active theme
+static const Theme_t* g_current_theme = NULL; // Initialized to default (e.g., &g_system_themes[THEME_ID_BASIC])
+```
+
+### 7.2 Logic for Applying Theme Parameters
+- `ApplicationLogic_Task` sends a `CMD_SET_THEME { ThemeID theme_id }` message.
+- `Display_Task` handles this by:
+    1.  Looking up the `Theme_t` structure from `g_system_themes` using `theme_id`.
+    2.  Setting `g_current_theme` to point to it.
+    3.  Triggering a full screen redraw to apply the new theme.
+```c
+void Display_Handle_SetTheme(const SetThemePayload_t* payload) {
+    if (payload->theme_id < NUM_THEMES) { // Ensure theme_id is valid
+        g_current_theme = &g_system_themes[payload->theme_id];
+        // Apply global U8g2 settings that are part of the theme directly
+        u8g2_SetFont(&g_u8g2, g_current_theme->font_primary);
+        u8g2_SetDrawColor(&g_u8g2, g_current_theme->default_draw_color);
+
+        Display_RenderCurrentScreen(); 
+        Display_PerformFullUpdate();
+    }
+}
+```
+- Drawing functions for UI elements, components, and screen handlers must then query `g_current_theme` to make rendering decisions:
+    - Select fonts (`g_current_theme->font_primary`).
+    - Determine base drawing colors (`g_current_theme->default_draw_color`, `g_current_theme->background_color`).
+    - Implement highlight styles based on `g_current_theme->list_item_highlight_style`, etc.
+    - Choose between text or graphical representations based on `g_current_theme->presentation_style`.
+    ```c
+    // Example in a component drawing function for a list item
+    // void Component_ListItem_Draw(u8g2_t* p_u8g2, int x, int y, const char* text, bool is_selected, const Theme_t* theme) {
+    //     u8g2_SetFont(p_u8g2, theme->font_primary);
+    //
+    //     if (theme->presentation_style == THEME_PRESENTATION_STYLE_GRAPHICAL && g_icon_for_list_item) {
+    //          u8g2_DrawXBM(p_u8g2, x, y, ICON_W, ICON_H, g_icon_for_list_item);
+    //          x += ICON_W + PADDING;
+    //     }
+    //
+    //     if (is_selected) {
+    //         switch (theme->list_item_highlight_style) {
+    //             case HIGHLIGHT_STYLE_INVERT:
+    //                 // Get text width: u8g2_GetStrWidth(p_u8g2, text)
+    //                 // Invert background for text area
+    //                 break;
+    //             case HIGHLIGHT_STYLE_BORDER:
+    //                 // Draw a border around the text area using theme->highlight_border_color
+    //                 break;
+    //         }
+    //     }
+    //     // Set appropriate draw color for text based on selection and theme
+    //     u8g2_DrawStr(p_u8g2, x, y + TEXT_OFFSET, text);
+    // }
+    ```
+
+### 7.3 Initial Theme
+`Display_Task` should initialize `g_current_theme` to a default theme (e.g., `&g_system_themes[THEME_ID_BASIC]`) during its startup. The actual theme structures will be defined in a configuration file like `App/Config/ui_themes.c` and made available via `extern const Theme_t g_system_themes[];`.
+
+void Display_Handle_ScreenDataCopyError() {
+    // Log the error
+    // LOG_ERROR("Display_Task: Failed to allocate memory for screen data.");
+
+    // Activate a predefined system error screen
+    // It is crucial that GetScreenSpecificDataSize(SCREEN_ID_SYSTEM_ERROR) returns 0,
+    // and the error screen handler itself requires no dynamic data, to prevent recursive failure.
+    ActivateScreenPayload_t error_screen_payload;
+    error_screen_payload.screen_id = SCREEN_ID_SYSTEM_ERROR; // Assume such an ID exists
+    error_screen_payload.screen_specific_data = NULL;       // Error screen should not need dynamic data
+    Display_Handle_ActivateScreen(&error_screen_payload);
+}

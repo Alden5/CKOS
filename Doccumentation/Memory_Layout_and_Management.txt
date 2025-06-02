@@ -1,0 +1,1 @@
+This document will provide a detailed breakdown of the system's memory (Flash and RAM maps). It will cover allocations for code, constants, static data, RTOS objects, task stacks, memory pools, MPU configuration details, and strategies for memory analysis and optimization. 

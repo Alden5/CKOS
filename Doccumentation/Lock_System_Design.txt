@@ -1,0 +1,416 @@
+# Lock System Design Document
+
+## 1. Overview
+This document details the design of the Lock System for the CKOS project. The Lock System is a core component responsible for managing all aspects of the device's locking mechanisms, including lock configuration, time tracking, state management for various lock types, and security features. The logic for the Lock System primarily resides within the `ApplicationLogic_Task`, as defined in `Doccumentation/architecture.txt`.
+
+This system interacts closely with:
+-   **`HardwareService_Task`**: For RTC access (timekeeping, alarms), persistent storage (EEPROM emulation for lock configurations and states), and potentially sensor data relevant to lock operation (though direct lock mechanism control is HLM's domain).
+-   **`Display_Task`**: For presenting lock-related information to the user, including setup screens, status displays, PIN entry, and verification screens. `ApplicationLogic_Task` will send commands and data to `Display_Task` for rendering.
+-   **Time Management System**: The Lock System relies on the UTC-based time provided by this system for all duration calculations and scheduling.
+-   **Agent System & Game System**: For Agent and Custom lock types, the Lock System will integrate with these systems, which also operate within `ApplicationLogic_Task`.
+
+The Lock System is designed to be robust, secure, and flexible, supporting multiple lock types and user interaction flows as outlined in `Doccumentation/architecture.txt`.
+
+## 2. Core Lock Data Structures
+
+All lock-related data structures are designed for memory efficiency and straightforward serialization to persistent storage.
+
+### 2.1 Lock Configuration Data
+
+These structures define the configuration and state for different lock types and the overall lock session.
+
+#### 2.1.1 `LockType_t` Enum
+Defines the types of locks available in the system.
+```c
+typedef enum {
+    LOCK_TYPE_NONE = 0,      // No lock active or selected
+    LOCK_TYPE_AGENT,         // Lock managed by a virtual agent
+    LOCK_TYPE_CUSTOM,        // User-defined lock duration and parameters
+    LOCK_TYPE_KEYHOLDER_BASIC, // Simple PIN-based lock
+    LOCK_TYPE_KEYHOLDER_REMOTE // Web service-bound keyholder lock
+} LockType_t;
+```
+
+#### 2.1.2 `AgentLockConfig_t` Struct
+Configuration specific to the Agent Lock.
+```c
+typedef struct {
+    uint8_t agent_id; // Identifier for the selected agent character
+    // Other agent-specific settings, e.g., difficulty, specific goals
+    // Total accumulated lock time for this agent type is stored separately (see LockTimeCounters_t)
+} AgentLockConfig_t;
+```
+
+#### 2.1.3 `CustomLockConfig_t` Struct
+Configuration specific to the Custom Lock.
+```c
+typedef struct {
+    uint32_t duration_seconds;    // Total lock duration set by the user
+    uint8_t game_ids[MAX_GAMES_PER_LOCK]; // IDs of selected mini-games
+    uint8_t num_games;
+    // Configuration for each game (e.g., difficulty) - to be detailed in Game_System_Design.txt
+    // Total accumulated lock time for custom locks is stored separately
+} CustomLockConfig_t;
+```
+
+#### 2.1.4 `KeyholderBasicLockConfig_t` Struct
+Configuration for Basic Keyholder Mode.
+```c
+#define PIN_MAX_LENGTH 8 // Example, can be adjusted
+typedef struct {
+    char pin[PIN_MAX_LENGTH + 1]; // Null-terminated PIN string
+    uint8_t pin_length;
+    // Options like max retry attempts before lockout (if any)
+    // Total accumulated lock time for this mode is stored separately
+} KeyholderBasicLockConfig_t;
+```
+
+#### 2.1.5 `KeyholderRemoteLockConfig_t` Struct
+Configuration for Remote Keyholder Mode.
+```c
+#define IDENTICON_UNIQUE_DATA_BYTES 2 // Storing 15 bits (5x3 unique blocks) for a 5x5 mirrored Identicon
+#define MAX_SERVICE_ID_LEN 64
+typedef struct {
+    char service_id[MAX_SERVICE_ID_LEN]; // Unique identifier for the bound web service/session
+    uint8_t identicon_unique_data[IDENTICON_UNIQUE_DATA_BYTES]; // Raw 15 bits of unique data for the 5x3 part of Identicon
+    uint32_t current_unlock_key_index;   // Last successfully used unlock key index
+    uint32_t current_cleaning_key_index; // Last successfully used cleaning key index (if different sequence)
+    uint32_t current_config_key_index;   // Last successfully used config key index (if different sequence)
+    uint16_t break_duration_minutes;     // Default duration for cleaning breaks, configurable by remote
+    // Other remotely configurable parameters
+    // Total accumulated lock time for this mode is stored separately
+} KeyholderRemoteLockConfig_t;
+```
+
+#### 2.1.6 `LockModeConfig_t` Union
+A union to hold the configuration for the currently active lock type, saving memory.
+```c
+typedef union {
+    AgentLockConfig_t agent_config;
+    CustomLockConfig_t custom_config;
+    KeyholderBasicLockConfig_t keyholder_basic_config;
+    KeyholderRemoteLockConfig_t keyholder_remote_config;
+} LockModeConfig_t;
+```
+
+#### 2.1.7 `LockSession_t` Struct (Master Lock Configuration and State)
+This is the primary structure representing an active or configured lock session. It will be saved to and restored from persistent storage.
+```c
+typedef enum {
+    LOCK_STATE_UNLOCKED,        // Device is unlocked
+    LOCK_STATE_CONFIGURING,     // User is setting up a new lock
+    LOCK_STATE_AWAITING_DOOR_CLOSE, // Configured, waiting for physical door closure
+    LOCK_STATE_LOCKED,          // Device is actively locked
+    LOCK_STATE_PENDING_UNLOCK,  // Unlock condition met, awaiting mechanism
+    LOCK_STATE_BREAK_ACTIVE,    // Temporarily unlocked for a break/clean
+    LOCK_STATE_ERROR            // Lock system error
+} LockOperationalState_t;
+
+typedef struct {
+    LockType_t active_lock_type;
+    LockOperationalState_t operational_state;
+    LockModeConfig_t mode_config; // Contains config for the active_lock_type
+
+    uint32_t utc_lock_start_time;     // UTC timestamp when the lock period began
+    uint32_t utc_unlock_target_time;  // UTC timestamp when the lock is scheduled to end (for time-based locks)
+    uint32_t current_session_accumulated_time_seconds; // Time accumulated in the current session, excluding breaks
+
+    // For "Cleaning/Breaks"
+    uint32_t utc_break_start_time;
+    uint16_t break_allowed_duration_seconds;
+
+    // Potentially a unique session ID if multiple lock instances need to be tracked over time,
+    // but for now, we assume one active lock session at a time.
+    // uint32_t session_id;
+} LockSession_t;
+
+// Global instance or handle to the current lock session within ApplicationLogic_Task
+// extern LockSession_t g_current_lock_session;
+```
+
+### 2.2 Persistent Storage
+
+Lock configurations and critical state information must persist across power cycles and firmware updates (where user data preservation is enabled, as per `architecture.txt` Section 3.3.1).
+
+#### 2.2.1 Mapping to EEPROM Emulation
+-   The `LockSession_t` structure will be the primary data blob saved to EEPROM emulation.
+-   Additionally, `LockTimeCounters_t` (see Section 3.2.1) will also be saved.
+-   The X-CUBE-EEP middleware, managed via `HardwareService_Task` through BSP calls, will be used.
+-   Specific virtual addresses/IDs will be assigned for `LockSession_t` and `LockTimeCounters_t`.
+-   `ApplicationLogic_Task` will request save operations from `HardwareService_Task` upon:
+    -   Successful lock configuration.
+    -   Lock initiation.
+    -   Unlock completion (to update state and potentially session time).
+    -   Changes to persistent settings (e.g., PIN update, remote keyholder config).
+    -   Periodic checkpoints for session time if deemed necessary.
+-   `ApplicationLogic_Task` will request load operations at startup to restore the last known lock state.
+
+#### 2.2.2 Data Integrity
+-   A CRC (e.g., CRC16) will be calculated over the `LockSession_t` and `LockTimeCounters_t` data before writing to EEPROM emulation.
+-   The CRC will be stored alongside the data.
+-   Upon reading from EEPROM, the CRC will be recalculated and verified to detect data corruption.
+-   If corruption is detected, the system may revert to a default unlocked state or prompt the user for reconfiguration, logging an error. This aligns with recovery mechanisms mentioned in `architecture.txt`.
+
+## 3. Time Tracking Implementation
+
+Accurate time tracking is fundamental to the Lock System. All timekeeping is based on UTC, as per the Time Management System defined in `architecture.txt` (Section 4.7).
+
+### 3.1 Core Principles
+-   **UTC-Based:** All internal timestamps (start time, target unlock time, break times) are stored in UTC seconds since epoch.
+-   **RTC as Source of Truth:** The hardware RTC, maintained in UTC, is the reference. `HardwareService_Task` provides access.
+-   **Total Accumulated Time:** Tracks the sum of all successfully completed lock durations for each lock type (Agent Beginner, Agent Advanced, Agent Permanent, Custom, Keyholder Basic, Keyholder Remote). This is persisted.
+-   **Current Session Time:** Tracks the duration the device has been locked in the *current* active lock session. This time does not accrue during "Cleaning/Breaks" or if the door is opened and the session is not formally resumed. This is part of `LockSession_t` and is persisted with it.
+-   **Remaining Lock Time:** Calculated dynamically for display to the user.
+
+### 3.2 Data Structures for Time
+
+#### 3.2.1 `LockTimeCounters_t` Struct
+Stores total accumulated lock times for various lock types. This is persisted separately from `LockSession_t` but is part of the Lock System's persistent data.
+```c
+typedef struct {
+    uint64_t total_locked_time_agent_beginner_seconds;  // Example: if agents have sub-types
+    uint64_t total_locked_time_agent_advanced_seconds;
+    uint64_t total_locked_time_agent_permanent_seconds;
+    uint64_t total_locked_time_custom_seconds;
+    uint64_t total_locked_time_keyholder_basic_seconds;
+    uint64_t total_locked_time_keyholder_remote_seconds;
+    // Potentially add counters for number of successful locks per type
+} LockTimeCounters_t;
+
+// Global instance or handle within ApplicationLogic_Task
+// extern LockTimeCounters_t g_lock_time_counters;
+```
+
+### 3.3 Algorithms
+
+These algorithms are executed within `ApplicationLogic_Task`.
+
+#### 3.3.1 Calculating Remaining Lock Time
+-   **Input:** `g_current_lock_session.utc_unlock_target_time`.
+-   Get current UTC time from Time Management System (via `HardwareService_Task`).
+-   **Remaining Time = `utc_unlock_target_time` - Current UTC Time.**
+-   If `utc_unlock_target_time` is 0 or in the past (and not yet unlocked), remaining time is 0.
+-   This is primarily for display and for checking if a timed lock has expired.
+
+#### 3.3.2 Calculating Total Accumulated Lock Time (Per Lock Type)
+-   When a lock session of a specific type successfully completes (i.e., unlocks after the full intended duration or a keyholder-defined endpoint):
+    -   Identify the `LockType_t` (and sub-type if applicable, e.g., Agent type).
+    -   Add the `g_current_lock_session.current_session_accumulated_time_seconds` to the corresponding counter in `g_lock_time_counters`.
+    -   Request `HardwareService_Task` to save `g_lock_time_counters` to persistent storage.
+
+#### 3.3.3 Calculating Current Session Time
+-   This is `g_current_lock_session.current_session_accumulated_time_seconds`.
+-   When the device is in `LOCK_STATE_LOCKED`:
+    -   Periodically (e.g., every minute, or on state changes/wake-ups), get the current UTC time.
+    -   Calculate elapsed time since the last update or `utc_lock_start_time`.
+    -   Increment `current_session_accumulated_time_seconds`.
+    -   This ensures the session time is reasonably up-to-date.
+    -   Care must be taken during "Cleaning/Breaks" not to accrue this time (see 3.4).
+
+#### 3.3.4 Setting Unlock Alarms (RTC Interaction)
+-   For time-based locks (`LOCK_TYPE_CUSTOM`, or Agent locks with a timed component):
+    -   When the lock is initiated (`LOCK_STATE_LOCKED` entered):
+        -   `ApplicationLogic_Task` calculates `g_current_lock_session.utc_unlock_target_time`.
+        -   It then requests `HardwareService_Task` to set an RTC wake-up alarm for this UTC timestamp.
+        -   The RTC alarm, upon triggering, will generate an event/interrupt that `HardwareService_Task` forwards to `ApplicationLogic_Task`. This event signals that the lock duration has nominally expired.
+
+### 3.4 "Cleaning/Breaks" Time Accrual Logic
+
+-   When a "Cleaning/Break" starts (`LOCK_STATE_BREAK_ACTIVE` entered):
+    -   The current value of `current_session_accumulated_time_seconds` is effectively frozen. No further session time should accrue.
+    -   The `utc_break_start_time` is recorded in `LockSession_t`.
+-   When the break ends and the device is re-locked (transitioning back to `LOCK_STATE_LOCKED`):
+    -   The `utc_lock_start_time` for the main lock session is *not* changed.
+    -   If the original lock was time-based (had a `utc_unlock_target_time`):
+        -   The `utc_unlock_target_time` needs to be extended by the duration of the break to ensure the user serves the full original lock time.
+        -   New `utc_unlock_target_time` = Old `utc_unlock_target_time` + (Current UTC - `utc_break_start_time`).
+        -   The RTC alarm in `HardwareService_Task` must be updated with this new target time.
+    -   The periodic accumulation of `current_session_accumulated_time_seconds` resumes.
+-   If the door remains closed and the session is resumed (as per `architecture.txt` 2.1.3 "Agent lock"), the `current_session_accumulated_time_seconds` continues to accrue as if no break occurred, assuming this is a very brief, non-penalized release. The distinction between a formal "Cleaning/Break" (where session time pauses) and a brief "release" needs careful state management. For this document, "Cleaning/Breaks" implies session time pauses.
+
+## 4. Lock Type Specific Implementation (within `ApplicationLogic_Task`)
+
+The following sections describe the specific logic for each lock type, all managed within `ApplicationLogic_Task`.
+
+### 4.1 Common Lock Operations API (Conceptual Internal API within `ApplicationLogic_Task`)
+
+These functions represent the internal API that `ApplicationLogic_Task`'s state machine would use to manage locks.
+
+-   `void LockSys_ConfigureLock(LockType_t type, void* pConfigData)`:
+    -   Sets `g_current_lock_session.active_lock_type` and copies `pConfigData` into `g_current_lock_session.mode_config`.
+    -   Transitions `g_current_lock_session.operational_state` to `LOCK_STATE_CONFIGURING`.
+    -   Prompts user for confirmation if necessary (e.g., long durations).
+    -   Saves configuration to persistent storage via `HardwareService_Task` upon finalization.
+-   `bool LockSys_InitiateLock(void)`:
+    -   Called when door closure is confirmed by `HardwareService_Task` and state is `LOCK_STATE_AWAITING_DOOR_CLOSE`.
+    -   Sets `g_current_lock_session.utc_lock_start_time` to current UTC.
+    -   Calculates `g_current_lock_session.utc_unlock_target_time` if applicable.
+    -   Sets RTC alarm via `HardwareService_Task` if applicable.
+    -   Transitions `g_current_lock_session.operational_state` to `LOCK_STATE_LOCKED`.
+    -   Saves `LockSession_t` to persistent storage.
+    -   Sends command to `Display_Task` to update UI.
+-   `LockOperationalState_t LockSys_GetStatus(void)`:
+    -   Returns `g_current_lock_session.operational_state`.
+    -   May also update dynamic info like remaining time if called frequently for display.
+-   `bool LockSys_AttemptUnlock(void* pUnlockParam)`:
+    -   Validates `pUnlockParam` based on `active_lock_type` (e.g., PIN, remote key).
+    -   If valid:
+        -   Transitions `operational_state` to `LOCK_STATE_PENDING_UNLOCK`.
+        -   Requests `HardwareService_Task` to actuate the physical lock mechanism.
+        -   Upon confirmation from `HardwareService_Task` of successful physical unlock:
+            -   Update `LockTimeCounters_t` for the completed session.
+            -   Reset `g_current_lock_session` to a default unlocked state (e.g., `LOCK_TYPE_NONE`, `LOCK_STATE_UNLOCKED`).
+            -   Save persistent data.
+            -   Send command to `Display_Task`.
+        -   Returns `true`.
+    -   If invalid:
+        -   Handle failure (e.g., increment retry counter, notify user via `Display_Task`).
+        -   Returns `false`.
+-   `void LockSys_HandleExternalEvent(LockSystemEvent_t event, void* pEventData)`:
+    -   Processes events like RTC alarm trigger, door sensor changes (relayed by `HardwareService_Task`), agent decisions, game outcomes.
+    -   Updates `LockSession_t` state accordingly.
+
+### 4.2 Agent Lock
+
+-   **Logic:** `ApplicationLogic_Task` manages Agent Lock state.
+-   **Configuration:** `AgentLockConfig_t` stores `agent_id`. User selects an agent. Total accumulated locked time for this agent is tracked in `LockTimeCounters_t`.
+-   **Interaction:**
+    -   `ApplicationLogic_Task` (Lock System part) interfaces with `ApplicationLogic_Task` (Agent System part).
+    -   When an Agent Lock is active, certain user inputs or system events might be routed to the Agent System for processing.
+    -   The Agent System can influence the lock (e.g., offer early unlock, modify conditions, react to break requests) by sending internal commands/events back to the Lock System logic within `ApplicationLogic_Task`.
+    -   The specifics of agent interaction (dialogs, mood changes) are detailed in `Agent_System_Design.txt`.
+
+### 4.3 Custom Lock
+
+-   **Logic:** `ApplicationLogic_Task` manages Custom Lock state.
+-   **Configuration:** `CustomLockConfig_t` stores `duration_seconds` and selected `game_ids`.
+    -   **Duration Validation:**
+        -   Min duration: 1 minute. Max duration: 100 years.
+        -   Durations over 1 year require multiple confirmations from the user (UI flow managed by `ApplicationLogic_Task` commanding `Display_Task`).
+-   **Game Integration:**
+    -   `ApplicationLogic_Task` (Lock System part) interfaces with `ApplicationLogic_Task` (Game System part).
+    -   If games are configured, the Game System can modify lock parameters (primarily `utc_unlock_target_time` based on game outcomes).
+    -   The Game System sends events/results to the Lock System logic.
+
+### 4.4 Keyholder Lock (Basic Mode)
+
+-   **Logic:** `ApplicationLogic_Task` manages Keyholder Basic Mode.
+-   **Configuration:** `KeyholderBasicLockConfig_t` stores the `pin`. The PIN will be exactly 8 digits.
+-   **PIN Management:**
+    -   **Setting:** User inputs an 8-digit PIN via UI (`Display_Task` renders PIN entry, `ApplicationLogic_Task` processes input). PIN is stored in `KeyholderBasicLockConfig_t`.
+    -   **Validation:** On unlock attempt, user enters PIN. `ApplicationLogic_Task` compares input PIN with stored PIN.
+    -   **Storage:** The PIN is stored as a character array directly (plaintext) in `KeyholderBasicLockConfig_t` within the EEPROM emulation area. This approach prioritizes simplicity for "Basic Mode," acknowledging that if the device's flash memory is accessed directly (e.g., via debugger, as RDP Level 0 is maintained for user control), the PIN would be exposed.
+-   **Unlock:** Successful PIN entry triggers `LockSys_AttemptUnlock()`.
+
+### 4.5 Keyholder Lock (Remote Mode)
+
+-   **Logic:** `ApplicationLogic_Task` manages Keyholder Remote Mode.
+-   **Configuration:** `KeyholderRemoteLockConfig_t` stores `service_id`, `identicon_unique_data`, key indices, etc.
+-   **Device Pairing Process:**
+    -   Occurs when device is unlocked.
+    -   Website provides a code; user enters it on the device (UI by `Display_Task`, logic by `ApplicationLogic_Task`).
+    -   This code, or a derivative, could become the `service_id`.
+    -   `ApplicationLogic_Task` saves the `service_id` and other relevant pairing data (e.g., initial key index, data for Identicon) into `KeyholderRemoteLockConfig_t` and persists it.
+-   **Connection Identicon:**
+    -   The `identicon_unique_data` (15 bits, stored in `IDENTICON_UNIQUE_DATA_BYTES`) is stored in `KeyholderRemoteLockConfig_t`.
+    -   This data is generated by the device by hashing/processing the `service_id` received during pairing. The algorithm should produce 15 distinct bits.
+    -   `ApplicationLogic_Task` passes this 15-bit data to `Display_Task`. `Display_Task` is responsible for rendering the full 5x5 Identicon by taking the 5x3 unique pattern and mirroring it vertically to create the 5x5 visual.
+-   **Unlock Key Processing:**
+    -   Web service provides rolling/sequential unlock codes. User enters code on device.
+    -   `ApplicationLogic_Task` validates the code against `current_unlock_key_index`.
+    -   A large `KEY_WINDOW_SIZE` (e.g., 100-200, exact value TBD and configurable in `App/Config/`) will be used to minimize synchronization failures due to missed keys. The device will attempt to validate keys from its `current_unlock_key_index` up to `current_unlock_key_index + KEY_WINDOW_SIZE`.
+    -   **Algorithm:**
+        1.  Key received from user.
+        2.  Assume key itself implies an index or is part of a sequence from which an expected value can be derived.
+        3.  Compare received key/derived value against expected keys within the window: [`current_unlock_key_index`, `current_unlock_key_index + KEY_WINDOW_SIZE -1`].
+        4.  If a match is found at index `matched_index`:
+            -   `current_unlock_key_index` is updated to `matched_index + 1` (enforcing single-use and advancing index).
+            -   Persist the updated `KeyholderRemoteLockConfig_t`.
+            -   Proceed with unlock.
+        5.  If no match, reject key.
+    -   This system does not rely on RTC for key validity, only on sequence. Explicit re-synchronization protocols are not planned for the initial device firmware; the large window is the primary mechanism to handle potential drift between device and server key indices.
+-   **Cleaning Key Processing:**
+    -   Similar to unlock keys but might use a different index (`current_cleaning_key_index`) or key space.
+    -   Key authorizes a temporary unlock for `break_duration_minutes` (from `KeyholderRemoteLockConfig_t`).
+    -   `ApplicationLogic_Task` manages this as a "Cleaning/Break" (see Section 5).
+    -   After relocking, confirmation data (duration, time, Identicon) is prepared for `Display_Task`.
+-   **Config Key Processing:**
+    -   Longer codes that embed configuration changes.
+    -   `ApplicationLogic_Task` parses the key to extract parameters and new values.
+    -   Validates and applies changes to `KeyholderRemoteLockConfig_t` or other relevant settings (e.g., `break_duration_minutes`, scheduled breaks).
+    -   Persists changes. Example: `CONFIG_KEY_SET_BREAK_DURATION_15M`.
+
+## 5. "Cleaning/Breaks" Feature Implementation
+
+This feature allows temporary unlocks. Logic resides in `ApplicationLogic_Task`.
+
+### 5.1 State Management
+-   `LockSession_t.operational_state` transitions to `LOCK_STATE_BREAK_ACTIVE`.
+-   `LockSession_t.utc_break_start_time` records when the break began.
+-   `LockSession_t.break_allowed_duration_seconds` stores how long the break can last. This can be pre-configured (Agent), user-initiated with a set duration, or set by a Keyholder Cleaning Key.
+
+### 5.2 Time Limit Enforcement
+-   When `LOCK_STATE_BREAK_ACTIVE` is entered:
+    -   `ApplicationLogic_Task` calculates `utc_break_end_target_time = utc_break_start_time + break_allowed_duration_seconds`.
+    -   It requests `HardwareService_Task` to set an RTC wake-up alarm for `utc_break_end_target_time`.
+-   If the RTC alarm triggers and the device is still in `LOCK_STATE_BREAK_ACTIVE` (i.e., door not yet re-locked):
+    -   `ApplicationLogic_Task` initiates penalty logic.
+    -   It commands `Display_Task` to show a "Relock overdue" message.
+
+### 5.3 Penalties
+-   If break time limit is exceeded:
+    -   **Agent Lock:** Send event to Agent System within `ApplicationLogic_Task` to negatively affect agent's mood.
+    -   **Session Time Reset:** `g_current_lock_session.current_session_accumulated_time_seconds` will be reset to 0 for the current lock session. This is a fixed rule and provides a strong deterrent against abusing break times.
+-   Decision on penalties is made by `ApplicationLogic_Task`.
+
+### 5.4 Configuration
+-   Break duration and frequency can be:
+    -   Pre-defined by Agent personality.
+    -   Set by user during Custom Lock setup (if feature is enabled there).
+    -   Dynamically authorized by a Keyholder Cleaning Key, using `KeyholderRemoteLockConfig_t.break_duration_minutes`.
+    -   Set by a Keyholder Config Key for scheduled breaks (more complex, involves scheduling logic).
+
+## 6. Verification Screen Data Logic
+
+As per `architecture.txt` (Section 2.1.3), a verification screen is needed for third-party checks. `ApplicationLogic_Task` gathers this data and sends it to `Display_Task`.
+
+### 6.1 Data Elements
+-   **Total locked time since last door opening for this lock instance:**
+    -   This is `g_current_lock_session.current_session_accumulated_time_seconds`.
+-   **Current device date & time:**
+    -   `ApplicationLogic_Task` requests current UTC from Time Management System.
+    -   It also requests timezone offset and DST status to calculate local time.
+-   **Device serial number:**
+    -   A unique factory-set serial number. `ApplicationLogic_Task` requests this from `HardwareService_Task` (which reads it from a protected flash area or dedicated IC).
+-   **Current connection Identicon:**
+    -   If `g_current_lock_session.active_lock_type == LOCK_TYPE_KEYHOLDER_REMOTE`, then `g_current_lock_session.mode_config.keyholder_remote_config.identicon_data`.
+
+### 6.2 Data Gathering and Formatting
+-   A function within `ApplicationLogic_Task`, e.g., `void LockSys_GetVerificationScreenData(VerificationScreenData_t* pData)`, populates a structure.
+```c
+typedef struct {
+    uint32_t session_locked_time_seconds;
+    uint32_t current_utc_time;
+    int16_t timezone_offset_minutes; // For local time calculation by Display_Task or here
+    bool dst_active;
+    char device_serial_number[DEVICE_SERIAL_MAX_LEN + 1];
+    uint8_t identicon_data[IDENTICON_DATA_SIZE]; // Empty if not Keyholder Remote
+    bool is_keyholder_remote_active;
+} VerificationScreenData_t;
+```
+-   `ApplicationLogic_Task` then sends a command to `Display_Task` (e.g., `CMD_SHOW_VERIFICATION_SCREEN`) with `VerificationScreenData_t` as payload, via the `display_task_queue_handle`.
+
+## 7. Integration with `ApplicationLogic_Task` State Machine
+-   The Lock System's functions (`LockSys_ConfigureLock`, `LockSys_InitiateLock`, etc.) are called by the main state machine handlers within `ApplicationLogic_Task` in response to user inputs or system events.
+-   Events like `EVENT_DOOR_CLOSED`, `EVENT_RTC_ALARM_UNLOCK`, `EVENT_RTC_ALARM_BREAK_END`, `EVENT_PIN_SUBMITTED`, `EVENT_REMOTE_KEY_SUBMITTED` will trigger specific Lock System logic.
+-   The `g_current_lock_session.operational_state` is a key part of `ApplicationLogic_Task`'s overall state.
+-   **Communication Summary:**
+    -   `HardwareService_Task`:
+        -   Requests: Save/Load persistent data (`LockSession_t`, `LockTimeCounters_t`), Set RTC Alarm, Get Current UTC, Get Serial Number, physical lock actuation.
+        -   Events Received: Door status, RTC alarm triggers, physical lock status.
+    -   `Display_Task`:
+        -   Commands Sent: Update UI (show screens, remaining time, PIN entry, verification data, status messages).
+    -   Agent System / Game System (internal to `ApplicationLogic_Task`):
+        -   Interface calls or internal event passing for decisions, outcomes, and status updates.
+
+This design aims to cover all specified requirements, aligning with `Doccumentation/architecture.txt` by placing the core logic in `ApplicationLogic_Task` and defining interactions with other tasks and systems. 

@@ -1,0 +1,1 @@
+This document will expand on power management, detailing the state machine for power modes, battery monitoring algorithms, charger IC interaction, the 'insomnia' sleep suppression mechanism, FreeRTOS tickless idle integration, RTC wake-up management, and analysis of peripheral power states. 

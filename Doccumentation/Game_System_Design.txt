@@ -1,0 +1,1 @@
+This document will outline the design of mini-games, including their rules, mechanics, objectives, how they interact with ApplicationLogic_Task to modify lock conditions, their interface with Display_Task for visuals, and configuration options in "Custom Lock" mode. 

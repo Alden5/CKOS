@@ -1,0 +1,1 @@
+This document will provide comprehensive documentation for the Board Support Package (bsp_drivers.h/.c). Each BSP function will be detailed with its purpose, signature, parameters, return values, preconditions, postconditions, notes on HAL/LL usage, and example snippets. 

@@ -1,0 +1,1 @@
+This document will be a practical guide for developers, covering development environment setup, the full build process (including scripts), project configurations, firmware flashing procedures, and a comprehensive debugging guide (IDE features, MPU faults, RTOS issues, logging). 

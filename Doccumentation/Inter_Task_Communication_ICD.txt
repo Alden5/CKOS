@@ -1,0 +1,1 @@
+This document will formally define all communication interfaces between ApplicationLogic_Task, Display_Task, and HardwareService_Task. It includes RTOS queue message structures, message IDs, purpose, producers/consumers, task notification meanings, and any direct C API calls between components within the same task. 

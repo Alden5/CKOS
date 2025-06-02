@@ -1,0 +1,1 @@
+This document will serve as the definitive reference for the system's state machine logic. It will ideally contain the human-readable output of `generate_state_table.py` or, alternatively, the detailed state transition tables (e.g., listing states, events, handlers, and next states). 

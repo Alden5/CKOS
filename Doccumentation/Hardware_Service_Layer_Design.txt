@@ -1,0 +1,417 @@
+# Hardware Service Layer Design Document
+
+## 0. Introduction
+
+This document provides the detailed design for the `HardwareService_Task` and its constituent sub-modules, including the Hardware Lock Manager (HLM), Sensor Management, Storage Operations, and Low-Level Power Control. The `HardwareService_Task` is a critical component in the CKOS three-task architecture (see `architecture.txt`, Section 3.0), responsible for all direct hardware interactions, abstracting them from the `ApplicationLogic_Task`.
+
+It operates at the highest RTOS priority (Priority 5) to ensure timely processing of hardware events and requests. All hardware access from this task and its sub-modules is performed exclusively through the Board Support Package (BSP) layer, as mandated by `architecture.txt`, Section 3.0.3.
+
+## 1. `HardwareService_Task` Architecture
+
+The `HardwareService_Task` functions as an "Active Object," managing its state, processing incoming requests, and emitting notifications about hardware events.
+
+### 1.1. Task Definition and RTOS Configuration
+-   **Task Name:** `HardwareService_Task`
+-   **RTOS Priority:** 5 (Highest, as per `architecture.txt`, Section 3.0)
+-   **Stack Size:** ~1KB (as per `architecture.txt`, Section 3.0)
+-   **Core Affinity:** N/A (single core MCU)
+-   **MPU Protection:** Configured with stack overflow guard region and appropriate memory access permissions as per `architecture.txt`, Section 3.0.5.
+
+### 1.2. Internal State Management
+The `HardwareService_Task` may operate in several internal states to manage its execution flow, although it's primarily event-driven by messages from `ApplicationLogic_Task` and hardware interrupts. Potential states include:
+
+-   `HST_STATE_INITIALIZING`: During startup, initializing BSP, peripherals, and internal sub-modules.
+-   `HST_STATE_IDLE`: Waiting for incoming request messages or hardware interrupt notifications. Default operational state.
+-   `HST_STATE_PROCESSING_REQUEST`: Actively handling a request from `ApplicationLogic_Task` (e.g., actuating HLM, reading sensors, performing storage I/O).
+-   `HST_STATE_LOW_POWER_TRANSITION`: Preparing for and entering a low-power mode as requested.
+
+State transitions are primarily driven by message reception and completion of internal operations.
+
+### 1.3. Message Queue Processing (Requests from `ApplicationLogic_Task`)
+`HardwareService_Task` exposes its services via an RTOS message queue, as described in `architecture.txt`, Sections 4.3.2 and 4.4.
+
+-   **Queue Handle:** `hardware_service_request_queue` (Example name)
+-   **Queue Size:** Configurable, e.g., 10 messages.
+-   **Message Structure:** A generic request message structure will be used, with a command type and a union for command-specific parameters.
+
+    ```c
+    typedef enum {
+        REQ_NONE = 0,
+        REQ_UNLOCK,
+        REQ_GET_DOOR_STATUS, // Specific request for current door/latch sensor states
+        REQ_READ_SENSORS,    // General sensor read (e.g., battery, temperature)
+        REQ_WRITE_STORAGE,
+        REQ_READ_STORAGE,
+        REQ_SET_POWER_MODE,
+        REQ_PWM_CONTROL_RAW,  // For HLM precise control, if needed beyond REQ_UNLOCK
+        // ... other request types
+    } HST_Request_Type_t;
+
+    typedef struct {
+        // Parameters for REQ_UNLOCK, e.g., target temperature, max duration
+        // As per architecture.txt 2.2.4, HLM handles retry logic and incremental heating.
+        // Temperature compensation values might be derived internally or configured.
+    } HST_UnlockParams_t;
+
+    typedef struct {
+        uint32_t address;
+        uint8_t* data_ptr;
+        uint32_t length;
+        // uint16_t crc; // If ApplicationLogic_Task calculates CRC
+    } HST_StorageOpParams_t;
+
+    typedef enum {
+        POWER_MODE_RUN,    // Default active mode
+        POWER_MODE_SLEEP,  // Light sleep, CPU halt, peripherals active
+        POWER_MODE_STOP2,  // Deep sleep, RTC active
+        POWER_MODE_STANDBY // Lowest power, minimal retention
+    } HST_PowerMode_t;
+
+    typedef struct {
+        HST_PowerMode_t mode;
+    } HST_PowerModeParams_t;
+
+    typedef struct {
+        // Parameters for raw PWM control if exposed
+        // e.g., channel, duty_cycle, duration
+    } HST_PwmControlParams_t;
+
+    typedef struct {
+        HST_Request_Type_t type;
+        void* sender_task_handle; // Optional: for direct notification reply if needed
+        union {
+            HST_UnlockParams_t      unlock_params;
+            HST_StorageOpParams_t   storage_params;
+            HST_PowerModeParams_t   power_params;
+            HST_PwmControlParams_t  pwm_params;
+            // other params
+        } params;
+    } HST_RequestMessage_t;
+    ```
+
+The task's main loop will pend on `hardware_service_request_queue`. Upon receiving a message, it will dispatch to the appropriate sub-module or handler function.
+
+### 1.4. Task Notification Mechanisms (Events/Responses to `ApplicationLogic_Task`)
+`HardwareService_Task` communicates asynchronous events and responses to `ApplicationLogic_Task` using FreeRTOS task notifications (as per `architecture.txt`, Sections 4.3.2 and 4.4). `ApplicationLogic_Task`'s handle will be known (e.g., pre-configured or passed in init).
+
+-   **Notification Types and Values (Example):**
+    A 32-bit value will be used, where parts of the value can encode event type and associated data.
+
+    ```c
+    // Example encoding:
+    // Bits 31-24: Event Source (e.g., HLM, SENSOR, STORAGE, POWER)
+    // Bits 23-16: Event Code (e.g., BUTTON_PRESSED, DOOR_OPENED, UNLOCK_SUCCESS)
+    // Bits 15-0 : Event Data (e.g., ButtonID, SensorValue)
+
+    #define HST_EVT_SRC_HLM     (0x01 << 24)
+    #define HST_EVT_SRC_SENSOR  (0x02 << 24)
+    #define HST_EVT_SRC_STORAGE (0x03 << 24)
+    #define HST_EVT_SRC_POWER   (0x04 << 24)
+
+    // HLM Events
+    #define HST_EVT_UNLOCK_SUCCESS          (HST_EVT_SRC_HLM | (0x01 << 16))
+    #define HST_EVT_UNLOCK_FAILURE_LATCH    (HST_EVT_SRC_HLM | (0x02 << 16)) // Latch failed to actuate
+    #define HST_EVT_UNLOCK_FAILURE_BLOCKED  (HST_EVT_SRC_HLM | (0x03 << 16)) // Latch actuated, door blocked
+    #define HST_EVT_DOOR_CLOSED_LOCKED      (HST_EVT_SRC_HLM | (0x04 << 16)) // Confirmed door closed & latched
+    #define HST_EVT_DOOR_OPENED             (HST_EVT_SRC_HLM | (0x05 << 16)) // Confirmed door opened
+
+    // Sensor Events
+    #define HST_EVT_BUTTON_PRESS            (HST_EVT_SRC_SENSOR | (0x01 << 16)) // Data: ButtonID
+    #define HST_EVT_BUTTON_RELEASE          (HST_EVT_SRC_SENSOR | (0x02 << 16)) // Data: ButtonID
+    // Potentially no EVT_DOOR_STATUS, use HST_EVT_DOOR_CLOSED_LOCKED/HST_EVT_DOOR_OPENED from HLM based on sensor interpretation
+    #define HST_EVT_BATTERY_LOW             (HST_EVT_SRC_SENSOR | (0x03 << 16)) // Proactive low battery warning
+    #define HST_EVT_BATTERY_CRITICAL        (HST_EVT_SRC_SENSOR | (0x04 << 16)) // Proactive critical battery warning
+
+    // Storage Events
+    #define HST_EVT_STORAGE_WRITE_SUCCESS   (HST_EVT_SRC_STORAGE | (0x01 << 16))
+    #define HST_EVT_STORAGE_WRITE_FAILURE   (HST_EVT_SRC_STORAGE | (0x02 << 16))
+    #define HST_EVT_STORAGE_READ_SUCCESS    (HST_EVT_SRC_STORAGE | (0x03 << 16)) // Data may need separate buffer mechanism
+    #define HST_EVT_STORAGE_READ_FAILURE    (HST_EVT_SRC_STORAGE | (0x04 << 16))
+
+    // Power Events
+    #define HST_EVT_POWER_MODE_CHANGED      (HST_EVT_SRC_POWER | (0x01 << 16)) // Data: New PowerMode
+    ```
+    The `ApplicationLogic_Task` will be responsible for decoding these notification values.
+
+## 2. Hardware Lock Manager (HLM) Implementation
+
+The HLM sub-module is responsible for the physical locking and unlocking mechanism, primarily controlling the memory wire and monitoring associated sensors. It operates within the context of `HardwareService_Task`. (Ref `architecture.txt`, Sections 2.2, 4.3.1, 4.5, 5.0.2, 5.1.3, 5.2.1).
+
+### 2.1. Data Structures
+```c
+typedef struct {
+    // Configuration for HLM (e.g., PWM settings, timing parameters from persistent storage)
+    uint32_t base_pwm_pulse_ms;        // Base duration for memory wire PWM at nominal temp
+    uint32_t max_pwm_pulse_ms;         // Safety cutoff for PWM duration
+    uint8_t  max_retries;              // Max retries for latch actuation (e.g., 5)
+    // Temperature compensation lookup table or formula parameters
+    // Note: current_temperature_c is obtained from Sensor Management's cached value
+} HLM_Config_t;
+
+typedef enum {
+    HLM_OP_STATE_IDLE,
+    HLM_OP_STATE_ACTIVATING_WIRE,
+    HLM_OP_STATE_MONITORING_LATCH,
+    HLM_OP_STATE_MONITORING_EJECTOR,
+    HLM_OP_STATE_COOLDOWN
+} HLM_OperationalState_t;
+
+typedef struct {
+    HLM_Config_t config;
+    HLM_OperationalState_t op_state;
+    uint8_t current_retry_count;
+    // Handles to BSP resources (e.g., PWM timer, GPIOs for sensors/wire enable)
+    // These would be initialized via BSP calls.
+} HLM_Context_t;
+
+static HLM_Context_t g_hlm_context;
+```
+
+### 2.2. Memory Wire Actuation Sequence (`REQ_UNLOCK`)
+The core unlock logic, implementing retry and potential temperature compensation.
+
+1.  **Pre-computation & Insomnia:**
+    *   Call `ckos_power_insomnia_enter()` to prevent deep sleep.
+    *   Retrieve latest *cached* temperature reading from Sensor Management sub-module (e.g., `SensorMan_GetTemperature_C_x10()`).
+    *   Calculate compensated PWM duration based on `g_hlm_context.config` and current temperature. This might involve a lookup table or a formula to adjust `base_pwm_pulse_ms`. The duration should not exceed `max_pwm_pulse_ms`.
+    *   Increment PWM duration on subsequent retries (up to `max_pwm_pulse_ms`).
+
+2.  **Activation:**
+    *   Set `g_hlm_context.op_state = HLM_OP_STATE_ACTIVATING_WIRE`.
+    *   Enable memory wire power circuit: `bsp_gpio_write_pin(WIRE_ENABLE_PIN, HIGH)`.
+    *   Start PWM output: `bsp_pwm_set_precise(PWM_CHANNEL_WIRE, calculated_duty_cycle, calculated_duration_ms)` (or similar BSP function using LL drivers as per `architecture.txt` 4.5.1, 5.1.3). This function should be blocking or use a timer to manage the precise duration.
+
+3.  **Monitoring Latch Sensor:**
+    *   Set `g_hlm_context.op_state = HLM_OP_STATE_MONITORING_LATCH`.
+    *   After PWM duration (or during, if PWM is non-blocking and sensor is readable):
+        *   Read latch sensor: `bsp_gpio_read_pin(LATCH_SENSOR_PIN)`.
+        *   The sensor indicates if the latch has moved to the "unlocked" position.
+
+4.  **Monitoring Ejector Sensor (Door Opening):**
+    *   Set `g_hlm_context.op_state = HLM_OP_STATE_MONITORING_EJECTOR`.
+    *   Read ejector sensor: `bsp_gpio_read_pin(EJECTOR_SENSOR_PIN)`.
+    *   The sensor indicates if the door has popped open (ejector lever no longer pressed).
+
+5.  **Deactivation & Cooldown:**
+    *   Disable memory wire power circuit: `bsp_gpio_write_pin(WIRE_ENABLE_PIN, LOW)`.
+    *   Stop PWM output (if not already stopped by duration): `bsp_pwm_stop(PWM_CHANNEL_WIRE)`.
+    *   Set `g_hlm_context.op_state = HLM_OP_STATE_COOLDOWN` (optional, for tracking state).
+    *   Call `ckos_power_insomnia_exit()`.
+
+### 2.3. Unlock Logic and Retry Strategy
+(Ref `architecture.txt`, Section 2.2.4)
+
+```c
+// Simplified logic flow for REQ_UNLOCK handler function
+// HST_UnlockResult_t HLM_HandleUnlockRequest(HST_UnlockParams_t* params)
+
+g_hlm_context.current_retry_count = 0;
+bool unlock_successful = false;
+
+while (g_hlm_context.current_retry_count < g_hlm_context.config.max_retries) {
+    // Steps 1 & 2 from 2.2 (Pre-computation, Activation)
+    // This includes calculating potentially longer PWM duration for retry
+
+    // Step 3 from 2.2 (Monitoring Latch Sensor)
+    bool latch_actuated = (bsp_gpio_read_pin(LATCH_SENSOR_PIN) == LATCH_UNLOCKED_STATE);
+
+    if (latch_actuated) {
+        // Step 4 from 2.2 (Monitoring Ejector Sensor)
+        bool door_opened = (bsp_gpio_read_pin(EJECTOR_SENSOR_PIN) == EJECTOR_DOOR_OPEN_STATE);
+
+        if (door_opened) {
+            // SUCCESS
+            xTaskNotify(app_logic_task_handle, HST_EVT_UNLOCK_SUCCESS, eSetBits);
+            unlock_successful = true;
+            break; 
+        } else {
+            // Latch actuated, but door seems blocked
+            xTaskNotify(app_logic_task_handle, HST_EVT_UNLOCK_FAILURE_BLOCKED, eSetBits);
+            // ApplicationLogic_Task will prompt user. No further HLM retry for this specific error.
+            unlock_successful = false; // Or a specific status for "latch open, door stuck"
+            break; 
+        }
+    } else {
+        // Latch FAILED to actuate
+        g_hlm_context.current_retry_count++;
+        if (g_hlm_context.current_retry_count >= g_hlm_context.config.max_retries) {
+            xTaskNotify(app_logic_task_handle, HST_EVT_UNLOCK_FAILURE_LATCH, eSetBits);
+            unlock_successful = false;
+            break;
+        }
+        // Wait for a brief cooldown/retry delay before next attempt
+        vTaskDelay(pdMS_TO_TICKS(HLM_RETRY_DELAY_MS)); 
+    }
+}
+
+// Step 5 from 2.2 (Deactivation, Insomnia exit)
+// ...
+
+return unlock_successful ? SUCCESS_STATUS : FAILURE_STATUS; // Or a more detailed status
+```
+
+### 2.4. Processing Door/Lever Switch States (Lock Event Generation)
+HLM also processes sensor states to determine when the device is locked by the user. This is typically triggered by an interrupt from one of the door sensors.
+
+-   **Sensors:**
+    -   `EJECTOR_SENSOR_PIN`: Indicates physical presence of door/pin (door closed = sensor activated).
+    -   `LATCH_SENSOR_PIN`: Indicates latch has moved into locked position (door closed = latch sensor activated as latch is pushed out of the way by the door).
+-   **Locking Logic:**
+    1.  Door is closed: `EJECTOR_SENSOR_PIN` becomes active.
+    2.  Latch engages: `LATCH_SENSOR_PIN` becomes active.
+    3.  If both conditions are met, notify `ApplicationLogic_Task`: `xTaskNotify(app_logic_task_handle, HST_EVT_DOOR_CLOSED_LOCKED, eSetBits);`
+-   **Opening Logic (User manually opens after unlock):**
+    1.  Ejector sensor deactivates (door no longer pressing it).
+    2.  Notify `ApplicationLogic_Task`: `xTaskNotify(app_logic_task_handle, HST_EVT_DOOR_OPENED, eSetBits);`
+
+These events are generated from sensor ISRs (forwarded to `HardwareService_Task` via `vTaskNotifyGiveFromISR`) or polled if necessary.
+
+### 2.5. API (Internal to `HardwareService_Task`)
+```c
+void HLM_Init(HLM_Config_t* config);
+// Handles REQ_UNLOCK
+HST_UnlockResult_t HLM_ProcessUnlockRequest(const HST_UnlockParams_t* params); 
+// Called from sensor interrupt context (via task notification)
+void HLM_ProcessDoorSensorChange(uint8_t ejector_state, uint8_t latch_state); 
+```
+
+## 3. Sensor Management Implementation
+
+This sub-module manages button inputs (debouncing, event generation) and ADC readings for battery and temperature. (Ref `architecture.txt`, Sections 4.3.1, 5.0.4, 5.0.6, 5.1.2).
+
+### 3.1. Button Debouncing
+-   **Algorithm:** For each button, a state machine based on periodic sampling (e.g., every 10-20ms driven by a software timer within `HardwareService_Task`).
+    -   States: `BTN_RELEASED`, `BTN_MAYBE_PRESSED`, `BTN_PRESSED`, `BTN_MAYBE_RELEASED`.
+    -   Transition requires multiple consecutive samples in the new state to confirm.
+    -   Example: `BTN_RELEASED` -> `BTN_MAYBE_PRESSED` on first low sample. If N subsequent samples are low, transition to `BTN_PRESSED` and generate press event.
+-   **Configuration:** Debounce interval (N samples) configurable per button if needed.
+-   **Input:** Buttons are interrupt-capable GPIOs (BSP). ISRs will signal `HardwareService_Task` (e.g., `vTaskNotifyGiveFromISR`) which then can trigger the sampling/debouncing logic if not already active due to periodic timer. Alternatively, ISRs only record raw state change, and periodic task does all debouncing. The latter is simpler.
+
+### 3.2. Button Event Generation
+-   Upon confirmed debounced press: `xTaskNotify(app_logic_task_handle, HST_EVT_BUTTON_PRESS | (ButtonID & 0xFFFF), eSetBits);`
+-   Upon confirmed debounced release: `xTaskNotify(app_logic_task_handle, HST_EVT_BUTTON_RELEASE | (ButtonID & 0xFFFF), eSetBits);`
+-   `ButtonID` will be an enum: `BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_A, BTN_B`.
+-   Detection of long presses or repeat presses is responsibility of `ApplicationLogic_Task` as per Q&A.
+
+### 3.3. ADC Readings (Battery Voltage and Temperature)
+-   **Mechanism:** `HardwareService_Task` will use a software timer to periodically trigger ADC conversions for battery voltage and temperature sensor.
+    -   Sampling Interval: Configurable (e.g., Battery: every 1-5 seconds; Temperature: every 10-30 seconds, or less frequently if stable).
+-   **Data Caching:** Raw ADC values or converted values (mV, degrees Celsius) are cached within `HardwareService_Task`.
+    ```c
+    typedef struct {
+        uint16_t raw_battery_adc;
+        uint32_t battery_millivolts;
+        uint16_t raw_temperature_adc;
+        int16_t  temperature_degrees_c_x10; // Temp * 10 for one decimal place
+        // Timestamps of last update
+    } Sensor_CachedData_t;
+
+    static Sensor_CachedData_t g_sensor_cache;
+    ```
+-   **Access:**
+    -   Internal functions for other `HardwareService_Task` modules (e.g., HLM) to get latest cached values.
+    -   `ApplicationLogic_Task` can request values via `REQ_READ_SENSORS` message. `HardwareService_Task` would reply with a message or a dedicated notification containing the data.
+-   **Threshold Monitoring (Battery):**
+    -   `HardwareService_Task` will monitor `g_sensor_cache.battery_millivolts`.
+    -   If voltage drops below pre-defined "low" threshold: `xTaskNotify(app_logic_task_handle, HST_EVT_BATTERY_LOW, eSetBits);`
+    -   If voltage drops below pre-defined "critical" threshold: `xTaskNotify(app_logic_task_handle, HST_EVT_BATTERY_CRITICAL, eSetBits);` (This might also trigger direct power management actions like initiating deep sleep, as per `architecture.txt` 4.6).
+
+### 3.4. API (Internal to `HardwareService_Task`)
+```c
+void SensorMan_Init(void); // Starts periodic timers, initializes ADC through BSP
+void SensorMan_ProcessButtonInterrupt(uint8_t button_gpio_idx); // If ISRs just flag
+// Called by periodic timer to run debouncers and ADC sampling
+void SensorMan_PeriodicTask(void); 
+
+// Accessors for cached data
+uint32_t SensorMan_GetBatteryVoltage_mV(void);
+int16_t  SensorMan_GetTemperature_C_x10(void);
+void SensorMan_GetDoorSensorStates(bool* p_is_ejector_active, bool* p_is_latch_active);
+```
+
+## 4. Storage Operations Implementation
+
+This sub-module handles interactions with non-volatile memory (Flash for EEPROM emulation). (Ref `architecture.txt`, Sections 3.3.1, 4.3.1). It acts as a wrapper around BSP storage functions and the X-CUBE-EEP middleware.
+
+### 4.1. Data Structures
+```c
+// For REQ_READ_STORAGE and REQ_WRITE_STORAGE messages (already in HST_RequestMessage_t)
+// HST_StorageOpParams_t { uint32_t address; uint8_t* data_ptr; uint32_t length; }
+
+// For EEPROM emulation, addresses might be logical variable IDs
+typedef uint16_t EEPROM_VarID_t; 
+```
+
+### 4.2. Wrapper Logic (EEPROM Emulation via X-CUBE-EEP)
+-   `HardwareService_Task` will initialize and interface with the X-CUBE-EEP middleware via BSP calls.
+-   **API Mapping:**
+    -   `REQ_WRITE_STORAGE` with a logical `EEPROM_VarID_t` (passed in `address` field or a dedicated field in `HST_StorageOpParams_t`) and data will map to the EEPROM emulation write functions provided by the middleware.
+    -   `REQ_READ_STORAGE` with a logical `EEPROM_VarID_t` will map to EEPROM emulation read functions.
+-   The actual Flash R/W operations are handled by the middleware using BSP flash drivers.
+
+### 4.3. Data Integrity Checks (CRC)
+-   Data integrity for storage operations will primarily rely on the capabilities of the underlying X-CUBE-EEP middleware. If the middleware provides robust and transparent CRC (Cyclic Redundancy Check) or ECC (Error Correction Code) mechanisms, `HardwareService_Task` will leverage these directly.
+
+
+### 4.4. Flash Access and Insomnia
+-   All Flash write/erase operations (including those underlying EEPROM emulation) are critical and must be protected from power interruption or deep sleep.
+-   Before initiating any BSP Flash write/erase: `ckos_power_insomnia_enter()`.
+-   After completion (success or failure): `ckos_power_insomnia_exit()`.
+
+### 4.5. API (Internal to `HardwareService_Task`)
+```c
+void Storage_Init(void); // Initializes EEPROM emulation middleware
+// Handles REQ_WRITE_STORAGE
+bool Storage_Write(uint32_t logical_address_or_var_id, uint8_t* data, uint32_t length);
+// Handles REQ_READ_STORAGE
+bool Storage_Read(uint32_t logical_address_or_var_id, uint8_t* buffer, uint32_t length); 
+// Returns actual length read in buffer, or 0 on failure. Data includes CRC if raw.
+// If CRC is handled internally, length is payload length.
+```
+
+## 5. Low-Level Power Control Functions
+
+This sub-module, executed by `HardwareService_Task`, is responsible for commanding the BSP to change MCU power modes and interfacing with the `ckos_power_insomnia_level` mechanism. (Ref `architecture.txt`, Sections 3.0.4, 4.3.1, 4.6, 4.6.1).
+
+### 5.1. Commanding Power Mode Changes
+-   `ApplicationLogic_Task` requests power mode changes via `REQ_SET_POWER_MODE` message.
+-   `HardwareService_Task` receives this message and calls the appropriate internal handler.
+-   **Handler Logic:**
+    1.  Prepare peripherals for the target power mode (e.g., disable clocks, ensure I/O pins are in safe states). This is often handled by HAL functions called by BSP.
+    2.  Call the BSP function for the target mode:
+        -   `bsp_enter_stop2_mode()` (calls `HAL_PWREx_EnterSTOP2Mode()`)
+        -   `bsp_enter_sleep_mode()` (calls `HAL_PWR_EnterSLEEPMode()`)
+        -   `bsp_enter_standby_mode()` (calls `HAL_PWR_EnterSTANDBYMode()`)
+    3.  Wake-up sources are configured by CubeMX and HAL initialization, or can be adjusted by BSP functions if dynamic configuration is needed based on state (as per `architecture.txt` 3.1.5).
+    4.  After waking up from a low-power mode, system clocks and peripherals may need re-initialization; this is typically handled by the HAL startup code and `SystemClock_Config()`.
+    5.  Notify `ApplicationLogic_Task` of successful power mode transition if required: `xTaskNotify(app_logic_task_handle, HST_EVT_POWER_MODE_CHANGED | (new_mode & 0xFFFF), eSetBits);`
+
+### 5.2. Interfacing with `ckos_power_insomnia_level`
+-   `ckos_power_insomnia_level` is an atomic counter used globally to prevent deep sleep during critical operations (see `architecture.txt`, Section 4.6.1).
+-   `HardwareService_Task`'s sub-modules (HLM, Storage) are primary users of this mechanism for their critical hardware operations.
+-   **Functions (assumed to be globally available or via a utility module):**
+    -   `void ckos_power_insomnia_enter(void);` // Atomically increments counter
+    -   `void ckos_power_insomnia_exit(void);`  // Atomically decrements counter
+-   **Usage within `HardwareService_Task`:**
+    -   HLM: Around memory wire PWM burst.
+    -   Storage: Around Flash erase/write operations.
+    -   Any other time-critical or uninterruptible hardware sequence managed by `HardwareService_Task`.
+-   The RTOS idle hook (`vPortSuppressTicksAndSleep`) checks `ckos_power_insomnia_level`. If `> 0`, only light sleep (WFI) is permitted.
+
+### 5.3. API (Internal to `HardwareService_Task`)
+```c
+// Handles REQ_SET_POWER_MODE
+void PowerMan_SetMode(HST_PowerMode_t mode); 
+```
+
+## 6. Initialization Sequence for `HardwareService_Task`
+1.  Task Creation: `HardwareService_Task` is created by the main application initialization.
+2.  Within the task function, before entering the main loop:
+    a.  Initialize BSP functions relevant to `HardwareService_Task` (e.g., `bsp_adc_init()`, `bsp_pwm_init()`, `bsp_gpio_init_buttons()`, `bsp_gpio_init_lock_sensors()`).
+    b.  Initialize HLM sub-module: `HLM_Init(&default_hlm_config);` (load config from storage if available).
+    c.  Initialize Sensor Management sub-module: `SensorMan_Init();` (starts periodic timers for debouncing and ADC).
+    d.  Initialize Storage Operations sub-module: `Storage_Init();` (initializes EEPROM emulation).
+    e.  Initialize Power Management sub-module context if any.
+    f.  Signal `ApplicationLogic_Task` or system manager that `HardwareService_Task` is ready.
+
+This detailed design should serve as a solid foundation for implementing the `HardwareService_Task` and its components, aligning with the overall CKOS architecture. 

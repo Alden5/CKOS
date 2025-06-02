@@ -1,0 +1,53 @@
+# STM32CubeIDE
+.metadata/
+.settings/
+.cproject
+.project
+.mxproject
+
+# Build outputs
+Debug/
+Release/
+build/
+
+# Generated files
+*.d
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.ioc.bak
+
+# IDE specific files
+*.launch
+*.tmp
+
+# OS specific files
+.DS_Store
+Thumbs.db
+*~
+
+# Backup files
+*.bak
+*.orig
+
+# Log files
+*.log
+
+# Python cache (if using Python scripts)
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary files
+*.tmp
+*.temp
+
+# STM32CubeMX backup
+*.ioc.bak
+
+# Documentation build artifacts
+*.pdf~ 

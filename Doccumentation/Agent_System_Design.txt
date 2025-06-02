@@ -1,0 +1,1607 @@
+# Agent System Design Document
+
+## 1. Introduction
+This document details the design of the Agent System within the CKOS firmware, a core component of the user interaction experience. The Agent System is responsible for managing agent characters, their personalities, mood levels, dialog, and decision-making processes. All Agent System logic resides and executes within the `ApplicationLogic_Task`.
+
+The Agent System aims to create an engaging and dynamic experience for the user, where agent behavior is influenced by user interactions, lock duration, and game outcomes. It interacts closely with the `Display_Task` for presenting agent visuals and dialog, and with the main state machine of `ApplicationLogic_Task` for managing interaction context.
+
+Key functionalities include:
+- Defining distinct agent personalities.
+- Implementing a dynamic 4-dimensional mood engine (strictness, affection, patience, trust).
+- Managing a flexible dialog system.
+- Enabling contextual and mood-influenced agent decision-making.
+- Persisting agent state across device power cycles.
+
+This design adheres to the principles and constraints outlined in the main `Doccumentation/architecture.txt`, particularly regarding task responsibilities, inter-task communication, and memory management.
+
+## 2. Agent Data Structures
+The Agent System relies on structured data to define agent characteristics and maintain their state. These structures are designed for efficiency and clarity within an embedded environment.
+
+### 2.1 Agent Profile (`AgentProfile_t`)
+This structure defines the static characteristics of an agent. Profiles for all available agents are stored in Flash memory as constant data.
+
+```c
+typedef enum {
+    AGENT_PERSONALITY_FLEXIBLE_FRIENDLY,    // Warm, encouraging, lenient
+    AGENT_PERSONALITY_STRINGENT_NICE,       // Fair, follows rules, but still kind
+    AGENT_PERSONALITY_STRICT_DEMEANING,     // Very strict, harsh, critical
+    // Add more personalities as needed
+    AGENT_PERSONALITY_COUNT                 // Should be 3
+} AgentPersonality_t;
+
+// New enum for Lock Tiers
+typedef enum {
+    LOCK_TIER_BEGINNER,         // >2 days
+    LOCK_TIER_NOVICE,           // 1-2 weeks
+    LOCK_TIER_ADVANCED,         // 1-3 months
+    LOCK_TIER_PERMANENT,        // Indefinite
+    LOCK_TIER_COUNT
+} LockTier_t;
+
+// Forward declaration for mood image structure
+struct AgentMoodImages_s;
+
+// Structure to hold mood parameters for a specific lock tier
+typedef struct {
+    // Base mood values for 4D system (0-100) for this tier
+    uint8_t base_strictness;                 // Default strictness level (0=lenient, 100=strict)
+    uint8_t base_affection;                  // Default affection level (0=cold, 100=warm)
+    uint8_t base_patience;                   // Default patience level (0=impatient, 100=patient)
+    uint8_t base_trust;                      // Default trust level (0=suspicious, 100=trusting)
+    
+    // Mood volatility - how quickly each dimension changes (0-100%) for this tier
+    uint8_t strictness_volatility;           // Rate of strictness changes
+    uint8_t affection_volatility;            // Rate of affection changes
+    uint8_t patience_volatility;             // Rate of patience changes
+    uint8_t trust_volatility;                // Rate of trust changes (typically very low)
+
+    // Tier-specific dialog array ID (optional, if dialogs differ significantly per tier beyond mood)
+    uint16_t tier_dialog_array_id_offset;     // Offset or specific ID for this tier's dialogs
+} AgentTierParams_t;
+
+typedef struct {
+    const char* name_prefix;                  // Agent's base display name (e.g., "Rookie", "Veteran")
+                                            // The actual name will be a combination like "Rookie (Beginner Tier)"
+    AgentPersonality_t personality;           // Enum defining core behavior traits
+    const struct AgentMoodImages_s* mood_images_ref; // Pointer to a structure holding mood-specific image XBM C array pointers
+    uint16_t base_dialog_array_id;            // Identifier for the agent's main dialog array (e.g., index into a global table of dialog arrays)
+    
+    // Parameters for each lock tier
+    AgentTierParams_t tier_params[LOCK_TIER_COUNT];
+} AgentProfile_t;
+
+// Example structure for mood-specific images:
+typedef struct AgentMoodImages_s {
+    const unsigned char* happy_img_xbm;      // High affection
+    const unsigned char* neutral_img_xbm;    // Medium affection  
+    const unsigned char* cold_img_xbm;       // Low affection, high patience
+    const unsigned char* angry_img_xbm;      // Low affection, low patience
+    const unsigned char* strict_img_xbm;     // High strictness (optional)
+} AgentMoodImages_t;
+
+// Example:
+// const AgentMoodImages_t g_rookie_mood_images = {
+// .happy_img_xbm = g_xbm_rookie_happy,
+// .neutral_img_xbm = g_xbm_rookie_neutral,
+// .cold_img_xbm = g_xbm_rookie_cold,
+// .angry_img_xbm = g_xbm_rookie_angry,
+// .strict_img_xbm = g_xbm_rookie_strict
+// };
+//
+// const AgentProfile_t g_agent_profiles[AGENT_PERSONALITY_COUNT] = {
+//     [AGENT_PERSONALITY_FLEXIBLE_FRIENDLY] = {
+//         .name_prefix = "Flexi",
+//         .personality = AGENT_PERSONALITY_FLEXIBLE_FRIENDLY,
+//         .mood_images_ref = &g_flexi_mood_images,
+//         .base_dialog_array_id = DIALOG_ARRAY_ID_FLEXI_BASE,
+//         .tier_params = {
+//             [LOCK_TIER_BEGINNER] = {
+//                 .base_strictness = 10, .base_affection = 85, .base_patience = 90, .base_trust = 70,
+//                 .strictness_volatility = 20, .affection_volatility = 40, .patience_volatility = 30, .trust_volatility = 10,
+//                 .tier_dialog_array_id_offset = DIALOG_OFFSET_FLEXI_BEGINNER
+//             },
+//             [LOCK_TIER_NOVICE] = {
+//                 .base_strictness = 15, .base_affection = 80, .base_patience = 85, .base_trust = 65,
+//                 .strictness_volatility = 25, .affection_volatility = 45, .patience_volatility = 35, .trust_volatility = 12,
+//                 .tier_dialog_array_id_offset = DIALOG_OFFSET_FLEXI_NOVICE
+//             },
+//             // ... params for ADVANCED and PERMANENT tiers
+//         }
+//     },
+//     // ... other agent personalities
+// };
+```
+- **Image Asset References:** `mood_images_ref` points to a constant `AgentMoodImages_t` structure. This structure contains direct pointers to the XBM C arrays for different moods. The selection of the specific mood image pointer is now based on the combination of the three mood dimensions rather than a single mood state. See `Doccumentation/Asset_Pipeline_Guide.txt` for image asset details.
+
+### 2.2 Agent Runtime State (`AgentRuntimeState_t`)
+This structure holds the dynamic state of the currently selected agent. This state is persisted in EEPROM emulation to maintain continuity across sessions and power cycles. It is managed by `ApplicationLogic_Task`.
+
+```c
+typedef struct {
+    AgentPersonality_t current_agent_id;    // ID of the active agent
+    LockTier_t current_lock_tier;           // Current lock tier for this agent session
+    
+    // Four independent mood dimensions (0-100)
+    uint8_t strictness_level;               // Current strictness (0=lenient, 100=strict)
+    uint8_t affection_level;                // Current affection (0=cold, 100=warm)
+    uint8_t patience_level;                 // Current patience (0=impatient, 100=patient)
+    uint8_t trust_level;                    // Current trust (0=suspicious, 100=trusting)
+    
+    uint32_t interaction_flags;             // Bitfield for tracking key recent interactions (e.g., begged recently, complimented) - SESSION BASED
+    uint16_t interaction_count_session;     // Number of interactions in the current session
+    
+    // Trust-specific tracking
+    uint8_t promises_made;                  // Count of promises made this session
+    uint8_t promises_kept;                  // Count of promises kept this session
+    uint16_t total_trust_events;            // Lifetime count of trust-affecting events
+    
+    // Mood recovery timestamps (for time-based mood drift)
+    uint32_t last_mood_update_timestamp;    // RTC timestamp of last mood calculation
+} AgentRuntimeState_t;
+
+// This state is loaded from EEPROM on agent selection and saved periodically or on significant change.
+```
+- **Persistence:** The `AgentRuntimeState_t` structure is serialized and saved to EEPROM using the Storage service (within `HardwareService_Task`, requested by `ApplicationLogic_Task`). This typically occurs after significant mood changes (>10 points in any dimension), before entering low-power modes, or at the end of an interaction session.
+
+### 2.3 Interaction History
+Interaction history is primarily captured through `interaction_flags` and `interaction_count_session` in `AgentRuntimeState_t`.
+- `interaction_flags`: A bitmask where each bit represents a specific type of recent significant interaction (e.g., `USER_BEGGED_BIT`, `USER_APOLOGIZED_BIT`, `AGENT_GRANTED_FAVOR_BIT`). These flags are session-based and are reset when an agent interaction session ends or a new lock session with the agent begins. This allows the agent to "remember" key events in the short term within a continuous interaction period without storing extensive logs or carrying minor grievances across distinct sessions.
+- `interaction_count_session`: Tracks general engagement within the current session. Can influence mood (e.g., agent gets annoyed if bothered too much in one go).
+
+For longer-term influence, the "total accumulated locked time" for the *current lock type* (Beginner, Advanced, Permanent) is managed by the Lock System module (see `Doccumentation/Lock_System_Design.txt`) and can be queried by the Agent System to influence baseline mood or unlock certain dialogs/behaviors.
+
+## 3. Mood Engine Implementation
+The Mood Engine is responsible for dynamically adjusting the agent's three mood dimensions based on various internal and external factors. It runs within `ApplicationLogic_Task`.
+
+### 3.1 Four-Dimensional Mood System
+The agent's mood is represented by four independent dimensions that can vary simultaneously:
+
+1. **Strictness Level (0-100)**
+   - Measures how rigid vs. flexible the agent is with rules and requests
+   - 0 = Very lenient (often grants requests, bends rules)
+   - 100 = Very strict (rarely grants requests, follows rules rigidly)
+   - Affects: Early unlock probability, game allowances, break flexibility
+
+2. **Affection Level (0-100)**
+   - Measures emotional warmth and friendliness toward the user
+   - 0 = Cold/distant (terse, clinical responses)
+   - 100 = Warm/caring (friendly, supportive, encouraging)
+   - Affects: Dialog tone, response length, use of encouragement
+
+3. **Patience Level (0-100)**
+   - Measures tolerance for interruptions and repeated requests
+   - 0 = No patience (quickly annoyed, cuts interactions short)
+   - 100 = Very patient (tolerates repetition, explains decisions)
+   - Affects: Response to begging, interaction length, cooldown periods
+
+4. **Trust Level (0-100)**
+   - Measures belief in user's reliability and honesty
+   - 0 = Highly suspicious (expects manipulation, verifies everything)
+   - 100 = Complete trust (believes user, shares secrets, grants privileges)
+   - Affects: Special options availability, information sharing, rule flexibility
+   - Special properties:
+     - Changes more slowly than other dimensions
+     - Asymmetric: easier to lose than gain
+     - Unlocks unique behaviors at high levels
+     - Strongly persistent between sessions
+
+### 3.2 Mood Calculation Algorithm
+Each mood dimension is updated independently based on events:
+
+```c
+// Example mood update function
+void agent_update_mood(AgentRuntimeState_t* state, 
+                      const AgentProfile_t* profile,
+                      LockTier_t current_lock_tier,
+                      int8_t strictness_delta,
+                      int8_t affection_delta,
+                      int8_t patience_delta,
+                      int8_t trust_delta) {
+    
+    // Get tier-specific parameters
+    const AgentTierParams_t* tier_params = &profile->tier_params[current_lock_tier];
+
+    // Apply volatility scaling using tier_params
+    strictness_delta = (strictness_delta * tier_params->strictness_volatility) / 100;
+    affection_delta = (affection_delta * tier_params->affection_volatility) / 100;
+    patience_delta = (patience_delta * tier_params->patience_volatility) / 100;
+    
+    // Trust has special handling - asymmetric changes, using tier_params
+    if (trust_delta < 0) {
+        // Trust drops faster than it rises
+        trust_delta = (trust_delta * tier_params->trust_volatility * 2) / 100;
+    } else {
+        // Trust rises slowly
+        trust_delta = (trust_delta * tier_params->trust_volatility) / 100;
+    }
+    
+    // Update levels with clamping
+    state->strictness_level = CLAMP(state->strictness_level + strictness_delta, 0, 100);
+    state->affection_level = CLAMP(state->affection_level + affection_delta, 0, 100);
+    state->patience_level = CLAMP(state->patience_level + patience_delta, 0, 100);
+    state->trust_level = CLAMP(state->trust_level + trust_delta, 0, 100);
+}
+```
+
+### 3.3 Event-Based Mood Changes
+Different user actions affect mood dimensions differently:
+
+| User Action | Strictness | Affection | Patience | Trust |
+|------------|------------|-----------|----------|-------|
+| **User Requests:** | | | | |
+| Begging to decrease time | +3 | -3 | -10 | -1 |
+| Asking to increase time | -5 | +10 | +5 | +5 |
+| Begging for early unlock | +5 | -5 | -15 | -2 |
+| Begging for cleaning break | +2 | -2 | -8 | 0 |
+| Asking to play game | -2 | +5 | -3 | +1 |
+| **Request Outcomes:** | | | | |
+| Request granted | -2 | +3 | +5 | +2 |
+| Request denied | +1 | -1 | -2 | 0 |
+| Request on cooldown (spam) | +5 | -5 | -20 | -3 |
+| **Game Interactions:** | | | | |
+| Completing game successfully | -3 | +10 | +5 | +3 |
+| Failing game | +2 | -3 | -5 | 0 |
+| Refusing to play offered game | +3 | -8 | -5 | -2 |
+| **Break Behavior:** | | | | |
+| Break violation | +10 | -10 | -20 | -15 |
+| Returning on time from break | -2 | +5 | +10 | +8 |
+| Returning early from break | -3 | +8 | +8 | +5 |
+| **General Interactions:** | | | | |
+| Complimenting agent | 0 | +8 | +3 | +1 |
+| Long silence (5+ min) | 0 | -2 | +10 | 0 |
+| Thanking agent | -1 | +5 | +2 | +2 |
+| **Promise System:** | | | | |
+| Making a promise | 0 | +2 | 0 | 0* |
+| Keeping a promise | -3 | +5 | +5 | +10 |
+| Breaking a promise | +5 | -8 | -10 | -20 |
+| **Other Behaviors:** | | | | |
+| Honest admission of mistake | -2 | +3 | +2 | +5 |
+| Arguing with agent | +8 | -10 | -15 | -5 |
+| Following agent advice | -3 | +5 | +3 | +3 |
+
+*Making a promise tracks state but doesn't immediately affect trust
+
+### 3.4 Time-Based Mood Drift
+When no interaction occurs, mood dimensions drift toward base values:
+
+```c
+void agent_mood_time_drift(AgentRuntimeState_t* state, 
+                          const AgentProfile_t* profile,
+                          LockTier_t current_lock_tier,
+                          uint32_t elapsed_seconds) {
+    // Check every 5 minutes
+    if (elapsed_seconds < 300) return;
+    
+    // Get tier-specific parameters
+    const AgentTierParams_t* tier_params = &profile->tier_params[current_lock_tier];
+
+    // Calculate base drift for each dimension (2-3 points per 5 min)
+    int8_t base_drift_amount = 2 + (elapsed_seconds / 300);
+    
+    // Drift strictness toward base value from tier_params
+    if (state->strictness_level > tier_params->base_strictness) {
+        state->strictness_level = MAX(tier_params->base_strictness, 
+                                    state->strictness_level - base_drift_amount);
+    } else {
+        state->strictness_level = MIN(tier_params->base_strictness, 
+                                    state->strictness_level + base_drift_amount);
+    }
+    
+    // Affection drifts at 0.5x base rate
+    int8_t affection_drift = base_drift_amount / 2;
+    if (affection_drift == 0 && base_drift_amount > 0) affection_drift = 1; // Ensure some drift if base_drift > 0
+    if (state->affection_level > tier_params->base_affection) {
+        state->affection_level = MAX(tier_params->base_affection, 
+                                   state->affection_level - affection_drift);
+    } else {
+        state->affection_level = MIN(tier_params->base_affection, 
+                                   state->affection_level + affection_drift);
+    }
+
+    // Patience drifts at 1.5x base rate (recovers fastest)
+    int8_t patience_drift = (base_drift_amount * 3) / 2; // Same as 1.5x, avoids float
+    if (patience_drift == 0 && base_drift_amount > 0) patience_drift = 1; // Ensure some drift
+    if (state->patience_level > tier_params->base_patience) {
+        state->patience_level = MAX(tier_params->base_patience, 
+                                  state->patience_level - patience_drift);
+    } else {
+        state->patience_level = MIN(tier_params->base_patience, 
+                                  state->patience_level + patience_drift);
+    }
+    
+    // Trust doesn't drift with time - it only changes through actions
+    // Trust is "sticky" - maintains its level between sessions
+}
+```
+
+### 3.5 Accumulated Lock Time Influence
+Total accumulated lock time affects baseline mood tendencies:
+
+```c
+// After significant time locked (e.g., 10+ hours total)
+if (total_lock_hours > 10) {
+    // Get tier-specific parameters
+    // const AgentTierParams_t* tier_params = &profile->tier_params[current_lock_tier];
+
+    // Agents gradually become more lenient
+    effective_base_strictness = profile->tier_params[current_lock_tier].base_strictness - (total_lock_hours / 10); // ensure current_lock_tier is available
+    // But also less patient with repeated requests
+    effective_base_patience = profile->tier_params[current_lock_tier].base_patience - (total_lock_hours / 20); // ensure current_lock_tier is available
+}
+```
+
+### 3.6 Image Selection Based on Mood
+Agent images are selected based on mood dimension combinations:
+
+```c
+const unsigned char* agent_select_mood_image(const AgentRuntimeState_t* state,
+                                            const AgentMoodImages_t* images) {
+    // Primary selection based on affection
+    if (state->affection_level < 20) {
+        // Low affection - check patience for angry vs cold
+        return (state->patience_level < 30) ? 
+            images->angry_img_xbm : images->cold_img_xbm;
+    } else if (state->affection_level > 80) {
+        // High affection - always happy
+        return images->happy_img_xbm;
+    } else if (state->strictness_level > 80 && images->strict_img_xbm) {
+        // Very strict - show strict face if available
+        return images->strict_img_xbm;
+    } else {
+        // Medium affection - neutral
+        return images->neutral_img_xbm;
+    }
+}
+```
+
+### 3.7 Trust-Specific Behaviors
+Trust unlocks unique capabilities and affects agent behavior in special ways:
+
+```c
+// Trust level thresholds for special behaviors
+#define TRUST_THRESHOLD_BASIC      30   // Basic trust established
+#define TRUST_THRESHOLD_MODERATE   60   // Moderate trust, some privileges
+#define TRUST_THRESHOLD_HIGH       80   // High trust, special options
+#define TRUST_THRESHOLD_COMPLETE   95   // Complete trust, all privileges
+
+// Example trust-gated features
+if (state->trust_level >= TRUST_THRESHOLD_HIGH) {
+    // Agent might share personal information
+    enable_dialog_branch(DIALOG_PERSONAL_STORIES);
+    
+    // More flexible with rules even if strict
+    early_unlock_bonus += 20;
+    
+    // Offers special games or challenges
+    enable_option(OPTION_SECRET_CHALLENGE);
+}
+
+if (state->trust_level >= TRUST_THRESHOLD_COMPLETE) {
+    // Agent fully trusts user's word
+    enable_option(OPTION_PROMISE_BASED_UNLOCK);
+    
+    // Shares agent "secrets" or easter eggs
+    enable_dialog_branch(DIALOG_AGENT_SECRETS);
+}
+
+// Low trust behaviors
+if (state->trust_level < TRUST_THRESHOLD_BASIC) {
+    // Agent questions user's motives
+    enable_dialog_branch(DIALOG_SUSPICIOUS);
+    
+    // Requires verification for claims
+    disable_option(OPTION_EMERGENCY_UNLOCK);
+    
+    // Less likely to grant any favors
+    favor_probability_multiplier = 0.5;
+}
+```
+
+### 3.8 Impact of Mood on Behavior
+The four dimensions combine to create complex behaviors:
+
+- **Decision Making:** Base probability modified by all four dimensions
+  ```c
+  probability = base_prob;
+  probability += (100 - state->strictness_level) / 4;  // Less strict = higher chance
+  probability += state->affection_level / 5;           // More affection = higher chance  
+  probability -= (100 - state->patience_level) / 3;    // Less patience = lower chance
+  
+  // Trust has multiplicative effect
+  float trust_multiplier = 0.5 + (state->trust_level / 100.0) * 0.75;  // 0.5x to 1.25x
+  probability = probability * trust_multiplier;
+  ```
+
+- **Dialog Tone:** Selected based on mood combinations
+  - Strict + Cold + Impatient + Untrusting: "No. I don't believe you. Stop asking."
+  - Lenient + Warm + Patient + Trusting: "I trust you. Let's work something out together."
+  - Strict + Warm + Patient + Trusting: "I care about you and trust you, but rules are rules."
+  - Any mood + Very Low Trust: "Prove it first, then we'll talk."
+
+- **Available Options:** Some options only appear with certain mood combinations
+  - "Negotiate" option: Requires patience > 50
+  - "Plead emotionally" option: Requires affection > 40  
+  - "Challenge to game" option: Requires strictness < 70
+  - "Make a promise" option: Requires trust > 30
+  - "Emergency unlock" option: Requires trust > 60
+  - "Secret menu" option: Requires trust > 80
+
+### 3.9 Persistence Triggers
+The system saves state when:
+- Any dimension changes by >10 points
+- 5 cumulative changes occur without saving
+- Before sleep mode
+- End of interaction session
+- After significant events (game completion, break violation)
+
+## 4. Dialog System Implementation
+The Dialog System, part of `ApplicationLogic_Task`, manages the storage, selection, and presentation of agent dialog.
+
+### 4.1 Dialog Content Storage
+Dialog text is stored in Flash as constant C string arrays or structures.
+```c
+typedef struct {
+    uint16_t dialog_id;             // Unique ID for this dialog entry
+    
+    // Mood range requirements (0-100 each, 255 = don't care)
+    uint8_t min_strictness;         // Minimum strictness level
+    uint8_t max_strictness;         // Maximum strictness level  
+    uint8_t min_affection;          // Minimum affection level
+    uint8_t max_affection;          // Maximum affection level
+    uint8_t min_patience;           // Minimum patience level
+    uint8_t max_patience;           // Maximum patience level
+    uint8_t min_trust;              // Minimum trust level
+    uint8_t max_trust;              // Maximum trust level
+    
+    uint16_t context_flags;         // Bitmask for specific situations (e.g., GREETING, FAREWELL, RESPONSE_TO_BEG)
+    const char* text;               // The dialog string, potentially with format specifiers
+    
+    // Priority for selection when multiple dialogs match
+    uint8_t priority;               // Higher = more likely to be selected
+} DialogEntry_t;
+
+// Example dialog entries showing mood combinations:
+// const DialogEntry_t g_rookie_dialogs[] = {
+//     // High affection, any strictness/patience - warm greeting
+//     {.dialog_id = 1, .min_affection = 70, .max_affection = 100,
+//      .min_strictness = 255, .max_strictness = 255,
+//      .min_patience = 255, .max_patience = 255,
+//      .min_trust = 255, .max_trust = 255,
+//      .context_flags = DIALOG_CTX_GREETING,
+//      .text = "Hey there! So wonderful to see you again!",
+//      .priority = 10},
+//     
+//     // Low patience response to begging
+//     {.dialog_id = 2, .min_patience = 0, .max_patience = 30,
+//      .min_affection = 255, .max_affection = 255,
+//      .min_strictness = 255, .max_strictness = 255,
+//      .min_trust = 255, .max_trust = 255,
+//      .context_flags = DIALOG_CTX_BEG_RESPONSE,
+//      .text = "Stop. Asking. Now.",
+//      .priority = 15},
+//     
+//     // High trust special dialog
+//     {.dialog_id = 3, .min_trust = 80, .max_trust = 100,
+//      .min_affection = 60, .max_affection = 100,
+//      .min_strictness = 255, .max_strictness = 255,
+//      .min_patience = 255, .max_patience = 255,
+//      .context_flags = DIALOG_CTX_UNLOCK_REQUEST,
+//      .text = "You know what? I trust you. If you really need this, I'll help.",
+//      .priority = 20},
+//     
+//     // Low trust suspicious response
+//     {.dialog_id = 4, .min_trust = 0, .max_trust = 30,
+//      .min_affection = 255, .max_affection = 255,
+//      .min_strictness = 255, .max_strictness = 255,
+//      .min_patience = 255, .max_patience = 255,
+//      .context_flags = DIALOG_CTX_UNLOCK_REQUEST,
+//      .text = "Why should I believe you? You haven't earned my trust yet.",
+//      .priority = 18}
+// };
+```
+- **Organization:** Dialogs are organized into large C arrays of `DialogEntry_t`, one array per agent (or agent type if dialogs are shared). The `AgentProfile_t.base_dialog_array_id` can be an index into a table of these arrays or directly a pointer (cast appropriately) to the agent's specific dialog array in Flash. Runtime filtering is then applied to this array based on mood dimensions, context, and history.
+- **Mood Filtering:** The value 255 in any mood range field means "don't care" - that dimension is not considered for this dialog.
+- **Size:** Dialogs should be concise due to screen size and Flash memory constraints.
+
+### 4.2 Dialog Selection Logic
+This logic runs within `ApplicationLogic_Task`.
+1.  **Inputs:** Current `AgentProfile_t`, `AgentRuntimeState_t` (especially mood dimensions and `interaction_flags`), current interaction context (e.g., what just happened, what the user selected).
+2.  **Filtering:**
+    ```c
+    // Build list of matching dialogs
+    DialogEntry_t* matches[MAX_DIALOG_MATCHES];
+    uint8_t match_count = 0;
+    
+    for (i = 0; i < agent_dialog_count; i++) {
+        DialogEntry_t* dialog = &agent_dialogs[i];
+        
+        // Check context first (most restrictive)
+        if ((dialog->context_flags & current_context) == 0) continue;
+        
+        // Check mood dimensions (255 = don't care)
+        if (dialog->min_strictness != 255 && 
+            state->strictness_level < dialog->min_strictness) continue;
+        if (dialog->max_strictness != 255 && 
+            state->strictness_level > dialog->max_strictness) continue;
+            
+        if (dialog->min_affection != 255 && 
+            state->affection_level < dialog->min_affection) continue;
+        if (dialog->max_affection != 255 && 
+            state->affection_level > dialog->max_affection) continue;
+            
+        if (dialog->min_patience != 255 && 
+            state->patience_level < dialog->min_patience) continue;
+        if (dialog->max_patience != 255 && 
+            state->patience_level > dialog->max_patience) continue;
+        
+        if (dialog->min_trust != 255 && 
+            state->trust_level < dialog->min_trust) continue;
+        if (dialog->max_trust != 255 && 
+            state->trust_level > dialog->max_trust) continue;
+        
+        // Check interaction history flags if needed
+        if (dialog->context_flags & DIALOG_CTX_REQUIRES_HISTORY) {
+            if (!check_history_requirements(dialog, state->interaction_flags)) continue;
+        }
+        
+        matches[match_count++] = dialog;
+    }
+    ```
+3.  **Selection:** From the suitable dialogs, one is chosen based on priority and randomness:
+    ```c
+    if (match_count == 1) {
+        selected = matches[0];
+    } else if (match_count > 1) {
+        // Weight by priority
+        uint16_t total_weight = 0;
+        for (i = 0; i < match_count; i++) {
+            total_weight += matches[i]->priority;
+        }
+        
+        // Random weighted selection
+        uint16_t rand_val = xorshift32(&g_prng_state) % total_weight;
+        uint16_t cumulative = 0;
+        
+        for (i = 0; i < match_count; i++) {
+            cumulative += matches[i]->priority;
+            if (rand_val < cumulative) {
+                selected = matches[i];
+                break;
+            }
+        }
+    }
+    ```
+4.  **Output:** The selected `DialogEntry_t.text` string with any format specifiers processed.
+
+### 4.3 Dynamic Dialog Elements
+To make dialogs more engaging:
+- **Variable Substitution:** `printf`-style format specifiers (e.g., `%s` for username if available, `%d` for numbers like remaining time) can be used in dialog strings. `ApplicationLogic_Task` will format the string using `snprintf` with the necessary data before sending it to `Display_Task`.
+    *   Example: `"Only %d minutes left, %s!"`
+- **Conditional Text:** While complex conditional logic within strings is avoided, the selection logic itself can choose between different complete strings to achieve a similar effect.
+
+### 4.4 Interface with `Display_Task` for Dialog
+Once a dialog string is selected and formatted, `ApplicationLogic_Task` sends it to `Display_Task`:
+```c
+// In ApplicationLogic_Task:
+// DisplayCommand cmd;
+// cmd.id = CMD_UPDATE_TEXT_ELEMENT;
+// cmd.data.update_text.screen_id = SCREEN_ID_AGENT_INTERACTION; // Specific screen for agent
+// cmd.data.update_text.element_id = ELEMENT_ID_AGENT_DIALOG;   // Specific UI element for dialog
+// strncpy(cmd.data.update_text.text, formatted_dialog_string, MAX_DIALOG_LEN);
+// xQueueSend(display_task_queue_handle, &cmd, ...);
+```
+This follows the IPC mechanism defined in `Doccumentation/architecture.txt` and further detailed in `Doccumentation/Inter_Task_Communication_ICD.txt`.
+
+## 5. Agent Decision Logic Implementation
+Agents need to make decisions in response to user actions or specific situations. This logic is part of `ApplicationLogic_Task`.
+
+### 5.1 User Request Types and Evolution System
+The request system features dynamic evolution based on agent responses, trust levels, and interaction history. Each base request type can escalate through multiple variations, creating a more natural and engaging interaction flow.
+
+#### 5.1.1 Beg to Decrease Time (Escalating Request Chain)
+
+**Tier 1 - Polite Request:**
+- **Display:** "Ask politely for less time"
+- **Description:** Respectful request to reduce remaining lock time
+- **Example:** "Would it be possible to reduce the time a little?"
+- **Mood Impact:** Strictness: +1, Affection: 0, Patience: -3, Trust: 0
+- **Base Probability:** 25%
+- **Cooldown:** 8 minutes
+
+**Tier 2 - Earnest Plea (available after Tier 1 denial):**
+- **Display:** "Plead earnestly for time reduction"  
+- **Description:** More emotional appeal with reasoning
+- **Example:** "Please, I really think I've learned my lesson already"
+- **Mood Impact:** Strictness: +3, Affection: -2, Patience: -8, Trust: -1
+- **Base Probability:** 18%
+- **Cooldown:** 12 minutes
+
+**Tier 3 - Desperate Begging (available after 2+ denials):**
+- **Display:** "Beg desperately for any reduction"
+- **Description:** Last resort pleading, may damage relationship
+- **Example:** "I'm begging you, please, just 15 minutes off?"
+- **Mood Impact:** Strictness: +5, Affection: -5, Patience: -15, Trust: -3
+- **Base Probability:** 12%
+- **Cooldown:** 20 minutes
+- **Special:** Triggers agent "patience warning" response
+
+**Trust-Gated Variations:**
+- **"Negotiate time reduction" (Trust >60):** Presents logical arguments, higher success rate (35%)
+- **"Request mercy" (Trust >40):** Appeals to relationship, moderate success (22%)
+
+#### 5.1.2 Ask to Increase Time (Positive Reinforcement Chain)
+
+**Standard Request:**
+- **Display:** "Offer to add more time"
+- **Description:** Voluntary extension of lock duration
+- **Example:** "I'm really focused, could you add an hour?"
+- **Mood Impact:** Strictness: -5, Affection: +10, Patience: +5, Trust: +5
+- **Base Probability:** 95%
+- **Special:** No cooldown, builds "dedication score"
+
+**Advanced Variations (unlock based on history):**
+- **"Suggest specific extension" (after 2+ increases):** User proposes exact time, shows planning
+- **"Request challenge mode" (dedication score >5):** Asks for longer time with restrictions
+- **"Offer time gift" (trust >70):** Presents as gift to agent, maximum mood boost
+
+#### 5.1.3 Beg for Early Unlock (High-Stakes Escalation)
+
+**Tier 1 - Request Release:**
+- **Display:** "Ask for early release"
+- **Description:** Polite request for early unlock with explanation
+- **Example:** "Something came up - could you unlock me early?"
+- **Mood Impact:** Strictness: +3, Affection: -2, Patience: -8, Trust: -1
+- **Base Probability:** 8%
+- **Cooldown:** 25 minutes
+
+**Tier 2 - Plead for Freedom:**
+- **Display:** "Plead urgently for unlock"
+- **Description:** More emotional, urgent appeal
+- **Example:** "Please, I really need to get out now!"
+- **Mood Impact:** Strictness: +6, Affection: -5, Patience: -15, Trust: -3
+- **Base Probability:** 4%
+- **Cooldown:** 35 minutes
+
+**Tier 3 - Emergency Appeal:**
+- **Display:** "Claim emergency situation"
+- **Description:** Last resort emergency claim
+- **Example:** "This is an emergency, please unlock immediately!"
+- **Mood Impact:** Strictness: +8, Affection: -8, Patience: -20, Trust: -5 (or +10 if genuine)
+- **Base Probability:** 2%
+- **Cooldown:** 60 minutes
+- **Special:** Triggers trust verification challenge
+
+**Trust-Exclusive Options:**
+- **"Honor system unlock" (Trust >85):** Agent trusts user's word completely
+- **"Emergency protocol" (Trust >70):** Verified emergency unlock process
+
+#### 5.1.4 Beg for Cleaning Break (Need-Based Progression)
+
+**Standard Break Request:**
+- **Display:** "Request hygiene break"
+- **Description:** Standard request for cleaning/bathroom break
+- **Example:** "I need a quick break for hygiene"
+- **Mood Impact:** Strictness: +2, Affection: -1, Patience: -5, Trust: 0
+- **Base Probability:** 45%
+- **Break Duration:** 10 minutes
+- **Cooldown:** 90 minutes
+
+**Escalated Variations:**
+- **"Extended break request" (after standard denial):** Asks for longer break, lower success
+- **"Health necessity" (multiple denials):** Appeals to health needs, guilt-based approach
+- **"Promise quick return" (trust >40):** Combines with promise system, higher success but trust risk
+
+**Trust-Based Options:**
+- **"Self-timed break" (Trust >75):** Agent trusts user to return on time
+- **"Extended personal time" (Trust >60):** Longer break for personal care
+
+#### 5.1.5 Ask to Play Game (Social Engagement Tree)
+
+**Basic Game Request:**
+- **Display:** "Suggest playing a game"
+- **Description:** Friendly request for game interaction
+- **Example:** "Would you like to play a game together?"
+- **Mood Impact:** Strictness: -2, Affection: +5, Patience: -2, Trust: +1
+- **Base Probability:** 65%
+- **Cooldown:** 15 minutes
+
+**Relationship-Based Variations:**
+- **"Challenge agent to game" (affection >60):** Competitive approach, playful
+- **"Request teaching game" (trust >50):** Agent teaches new game type
+- **"Propose game tournament" (games won >5):** Multi-round competition
+- **"Ask for story game" (trust >70):** Narrative/role-playing style interaction
+
+**Mood-Adaptive Games:**
+- **High Strictness:** Logic puzzles, rule-based games
+- **High Affection:** Cooperative, storytelling games  
+- **Low Patience:** Quick, simple games only
+- **High Trust:** Complex, strategic games
+
+### 5.2 Agent Proactive Behavior System
+Beyond responding to user requests, agents can initiate interactions based on context, mood, and relationship development. This creates a more dynamic, living relationship.
+
+#### 5.2.1 Mood-Driven Proactive Actions
+
+**High Affection Behaviors (>75):**
+- **Spontaneous Encouragement:** "You're doing so well! I'm proud of you."
+- **Check-in Messages:** "How are you feeling? Need anything?"
+- **Time Bonus Offers:** "You've been so good, would you like me to add 30 minutes?"
+- **Game Invitations:** "I'm in a playful mood - want to try a game?"
+
+**Low Patience Behaviors (<30):**
+- **Warning Messages:** "I need some quiet time. Please don't disturb me for a while."
+- **Interaction Limits:** Temporarily reduces available options
+- **Cooling Off Period:** "Let's both take a break from chatting."
+
+**High Trust Behaviors (>80):**
+- **Secret Sharing:** "Can I tell you something special? You've earned my trust."
+- **Special Privileges:** "I'm going to give you access to something exclusive."
+- **Relationship Milestone:** "We've built something really special together."
+
+**High Strictness Behaviors (>80):**
+- **Rule Reminders:** "Remember, we have standards to maintain."
+- **Discipline Checks:** "Let's review your commitment level."
+- **Progress Assessments:** Evaluates user's lock behavior
+
+#### 5.2.2 Time-Based Proactive Triggers
+
+**Session Duration Milestones:**
+- **15 minutes:** Initial check-in and mood establishment
+- **1 hour:** Progress acknowledgment and relationship building
+- **3 hours:** Major milestone celebration or difficulty check
+- **6+ hours:** Deep relationship moments, special content unlock
+
+**Inactivity Responses:**
+- **5 minutes silence:** "Everything okay? You're quiet."
+- **15 minutes silence:** "I'm here if you need me."
+- **30 minutes silence:** Agent mood slowly improves (patience recovery)
+- **1 hour+ silence:** "Welcome back! I missed chatting with you."
+
+#### 5.2.3 Context-Aware Proactive Offers
+
+**After Request Denial:**
+- **Consolation:** "I know that's disappointing. Let me explain why..."
+- **Alternative Offers:** "I can't do that, but how about this instead?"
+- **Future Incentives:** "If you show patience for X minutes, I might reconsider."
+
+**After Request Approval:**
+- **Gratitude Check:** "You remembered to thank me! That means a lot."
+- **Bonus Rewards:** "Since you were so polite, here's something extra."
+- **Trust Building:** "See? Good things happen when we work together."
+
+**Relationship Milestones:**
+- **First Game Win:** "Congratulations! You're getting good at this."
+- **Trust Breakthrough:** "I think we're becoming real friends."
+- **Perfect Behavior Day:** "You've been absolutely perfect today. I'm impressed."
+
+### 5.3 Advanced Request Context System
+Enhanced context tracking for more nuanced interactions:
+
+```c
+typedef enum {
+    REQUEST_DECREASE_TIME_POLITE,      // Tier 1
+    REQUEST_DECREASE_TIME_PLEA,        // Tier 2  
+    REQUEST_DECREASE_TIME_DESPERATE,   // Tier 3
+    REQUEST_DECREASE_TIME_NEGOTIATE,   // Trust-gated
+    REQUEST_INCREASE_TIME_STANDARD,    
+    REQUEST_INCREASE_TIME_SPECIFIC,    // Advanced variation
+    REQUEST_INCREASE_TIME_CHALLENGE,   // Challenge mode
+    REQUEST_EARLY_UNLOCK_REQUEST,      // Tier 1
+    REQUEST_EARLY_UNLOCK_PLEAD,        // Tier 2
+    REQUEST_EARLY_UNLOCK_EMERGENCY,    // Tier 3
+    REQUEST_EARLY_UNLOCK_HONOR,        // Trust-exclusive
+    REQUEST_BREAK_STANDARD,
+    REQUEST_BREAK_EXTENDED,            // Escalated
+    REQUEST_BREAK_HEALTH,              // Health necessity
+    REQUEST_BREAK_PROMISE,             // With promise
+    REQUEST_GAME_BASIC,
+    REQUEST_GAME_CHALLENGE,            // Competitive
+    REQUEST_GAME_TEACHING,             // Learning-focused
+    REQUEST_GAME_TOURNAMENT,           // Advanced
+    REQUEST_TYPE_COUNT
+} DetailedRequestType_t;
+
+typedef struct {
+    uint32_t last_request_timestamp[REQUEST_TYPE_COUNT];  // Track cooldowns
+    uint8_t request_count_session[REQUEST_TYPE_COUNT];    // Count per session
+    uint8_t consecutive_denials[REQUEST_TYPE_COUNT];      // Track frustration
+    uint8_t escalation_level[5];                          // Escalation per base type
+    uint32_t last_break_timestamp;                        // For break timing
+    uint8_t dedication_score;                             // Increased by time extensions
+    uint8_t games_played_session;                         // Games this session
+    uint8_t games_won_total;                              // Lifetime wins
+    uint8_t promises_active;                              // Current active promises
+    uint8_t perfect_behavior_streak;                      // Days without violations
+    uint32_t last_proactive_interaction;                  // Agent-initiated timing
+    uint16_t relationship_milestones_achieved;            // Bitmask of achievements
+} EnhancedRequestHistory_t;
+```
+
+### 5.3 Advanced Request Handling
+
+#### 5.3.1 Combo Requests
+Some requests can be combined for special outcomes:
+- **Increase Time + Play Game:** "I'll stay locked longer if we can play"
+  - Higher game approval (80%)
+  - Bonus affection (+3)
+  - Unlocks harder games
+
+- **Cleaning Break + Promise:** "I promise I'll come right back"
+  - Longer break allowed (up to 20 min)
+  - Tracks promise for trust impact
+  - Major trust loss if broken (-25)
+
+#### 5.3.2 Trust-Based Variations
+High trust unlocks special request options:
+- **Trust 60+:** "Emergency Unlock" option appears for early unlock
+- **Trust 70+:** "Extended Break" option (up to 30 minutes)
+- **Trust 80+:** "Honor System" - agent may grant requests based on user's word alone
+- **Trust 90+:** "Flexible Schedule" - user can negotiate custom lock arrangements
+
+#### 5.3.3 Repeated Request Handling
+```c
+// Escalating responses to repeated requests
+if (consecutive_denials[REQUEST_DECREASE_TIME] >= 3) {
+    // Agent becomes increasingly firm
+    if (state->patience_level < 30) {
+        // Potential "timeout" - agent refuses all requests for 30 min
+        enable_request_timeout(30 * 60);
+    }
+}
+
+// But also tracks positive patterns
+if (request_count_session[REQUEST_INCREASE_TIME] >= 3) {
+    // Agent becomes more generous with other requests
+    request_probability_bonus += 15;
+}
+```
+
+### 5.4 Decision Points
+Key scenarios where agent decisions are critical:
+- Evaluating user requests based on type, history, and mood
+- Offering unsolicited rewards for good behavior
+- Deciding request parameters (e.g., break duration, time reduction amount)
+- Selecting appropriate games based on mood and trust
+
+### 5.5 General Decision Factors
+Beyond request-specific factors, decisions are influenced by:
+- **Mood Dimensions** (most significant):
+  - `strictness_level`: Primary factor for rule-based decisions
+  - `affection_level`: Influences willingness to help or be flexible
+  - `patience_level`: Affects tolerance for repeated requests
+  - `trust_level`: Enables special options and affects decision confidence
+- **Agent Personality Traits**: Base tendencies from `AgentProfile_t`
+- **Interaction History**: `interaction_flags` and `RequestHistory_t`
+- **Game Outcomes**: Recent wins/losses affecting mood
+- **Accumulated Lock Time**: Long-term relationship development
+- **Context-Specific Rules**: Hard limits regardless of mood
+
+### 5.6 Enhanced Decision Algorithm
+A sophisticated system combining rules, probabilities, relationship context, and adaptive learning:
+
+#### 5.6.1 Multi-Layer Decision Process
+1. **Eligibility Check:** Verify request is available based on trust/history
+2. **Cooldown Verification:** Check time-based restrictions
+3. **Context Analysis:** Evaluate current relationship state and recent interactions
+4. **Mood-Based Probability:** Calculate base success chance from mood dimensions
+5. **Relationship Modifiers:** Apply trust, history, and milestone bonuses/penalties
+6. **Agent Personality Filter:** Apply agent-specific decision tendencies
+7. **Final Decision:** Determine outcome and prepare appropriate response
+
+```c
+typedef enum {
+    DECISION_GRANT_ENTHUSIASTIC,    // High success + positive mood boost
+    DECISION_GRANT_STANDARD,        // Normal success
+    DECISION_GRANT_RELUCTANT,       // Success but with warnings/conditions
+    DECISION_CONDITIONAL_GRANT,     // Success with requirements (e.g., promise)
+    DECISION_MAYBE_LATER,          // Soft rejection, try again soon
+    DECISION_REJECT_GENTLE,        // Kind but firm no
+    DECISION_REJECT_STERN,         // Harsh rejection
+    DECISION_REJECT_ANGRY,         // Angry rejection + mood penalty
+    DECISION_COOLDOWN,             // Too soon to ask again
+    DECISION_NOT_AVAILABLE,        // Option not unlocked yet
+    DECISION_RELATIONSHIP_DAMAGED,  // Trust too low for this request
+    DECISION_COUNT
+} EnhancedAgentDecision_t;
+
+AgentDecision evaluate_enhanced_request(DetailedRequestType_t request_type, 
+                                       AgentRuntimeState_t* state,
+                                       EnhancedRequestHistory_t* history,
+                                       const AgentProfile_t* profile) {
+    
+    // Layer 1: Eligibility Check
+    if (!is_request_unlocked(request_type, state, history)) {
+        return DECISION_NOT_AVAILABLE;
+    }
+    
+    // Layer 2: Cooldown Verification  
+    uint32_t time_since_last = current_time - history->last_request_timestamp[request_type];
+    uint32_t cooldown = get_dynamic_cooldown(request_type, state, history);
+    
+    if (time_since_last < cooldown) {
+        return DECISION_COOLDOWN;
+    }
+    
+    // Layer 3: Context Analysis
+    RequestContext_t context = analyze_request_context(state, history, request_type);
+    
+    // Layer 4: Mood-Based Probability
+    uint8_t base_probability = calculate_mood_probability(state, request_type);
+    
+    // Layer 5: Relationship Modifiers
+    float relationship_multiplier = calculate_relationship_modifier(state, history, context);
+    uint8_t final_probability = (uint8_t)(base_probability * relationship_multiplier);
+    
+    // Layer 6: Agent Personality Filter
+    final_probability = apply_personality_filter(final_probability, profile, request_type);
+    
+    // Layer 7: Final Decision with Response Type
+    return determine_response_type(final_probability, state, context, request_type);
+}
+
+// Context analysis for more nuanced decision making
+RequestContext_t analyze_request_context(AgentRuntimeState_t* state, 
+                                       EnhancedRequestHistory_t* history,
+                                       DetailedRequestType_t request_type) {
+    RequestContext_t context = {0};
+    
+    // Recent behavior patterns
+    context.recent_denials = history->consecutive_denials[get_base_request_type(request_type)];
+    context.escalation_level = history->escalation_level[get_base_request_type(request_type)];
+    context.time_since_last_success = get_time_since_last_grant(history, request_type);
+    
+    // Relationship state
+    context.trust_trend = calculate_trust_trend(state, history);
+    context.mood_stability = calculate_mood_stability(state);
+    context.relationship_quality = assess_relationship_quality(state, history);
+    
+    // Session context
+    context.session_duration = get_current_session_duration();
+    context.interaction_frequency = calculate_interaction_frequency(history);
+    context.recent_positive_interactions = count_recent_positive_interactions(history);
+    
+    return context;
+}
+```
+2.  **Probabilistic Choice:** For flexible decisions:
+    ```c
+    // Calculate probability based on mood dimensions
+    uint8_t calculate_decision_probability(
+        AgentRuntimeState_t* state,
+        DecisionType request,
+        uint8_t base_probability) {
+        
+        int16_t probability = base_probability;
+        
+        // Strictness impact (inverted - less strict = higher chance)
+        probability += (100 - state->strictness_level) / 4;
+        
+        // Affection impact (positive correlation)
+        probability += state->affection_level / 5;
+        
+        // Patience impact (low patience reduces chance)
+        if (state->patience_level < 50) {
+            probability -= (50 - state->patience_level) / 3;
+        }
+        
+        // Trust has multiplicative effect on final probability
+        float trust_multiplier = 0.5 + (state->trust_level / 100.0) * 0.75;
+        probability = probability * trust_multiplier;
+        
+        // Context modifiers
+        if (interaction_flags & USER_THANKED_RECENTLY) {
+            probability += 10; // Gratitude bonus
+        }
+        
+        // Clamp to valid range
+        return CLAMP(probability, 0, 100);
+    }
+    
+    // Make decision
+    uint8_t final_prob = calculate_decision_probability(state, request, base_prob);
+    uint8_t rand_val = xorshift32(&g_prng_state) % 100;
+    return (rand_val < final_prob) ? DECISION_GRANT : DECISION_REJECT;
+    ```
+3.  **Decision Trees:** For complex multi-step interactions:
+    ```c
+    // Example: Game offer decision tree
+    if (state->strictness_level < 70 && state->affection_level > 50) {
+        // Willing to offer game
+        if (state->patience_level > 60) {
+            // Patient enough to explain rules
+            return OFFER_GAME_WITH_TUTORIAL;
+        } else {
+            // Quick game only
+            return OFFER_QUICK_GAME;
+        }
+    } else if (state->strictness_level < 50 && user_requested_game) {
+        // Might allow if asked nicely
+        return CONSIDER_GAME_REQUEST;
+    } else {
+        // No games available
+        return NO_GAMES_AVAILABLE;
+    }
+    
+    // Trust-based special paths
+    if (request == REQ_EMERGENCY_UNLOCK && state->trust_level >= 60) {
+        // High trust allows emergency consideration
+        if (verify_emergency_claim()) {
+            return GRANT_EMERGENCY_UNLOCK;
+        }
+    }
+    
+    if (request == REQ_PROMISE_BASED && state->trust_level >= 80) {
+        // Very high trust enables promise-based decisions
+        track_promise();
+        return GRANT_ON_PROMISE;
+    }
+    ```
+
+### 5.7 Dynamic Option Generation System
+The enhanced request system generates contextually appropriate options that evolve based on relationship state, recent interactions, and agent personality. Options are intelligently filtered and prioritized to create natural interaction flows.
+
+#### 5.7.1 Intelligent Option Filtering
+```c
+void generate_contextual_options(AgentRuntimeState_t* state, 
+                               EnhancedRequestHistory_t* history,
+                               const AgentProfile_t* profile,
+                               AgentOptionEntry_t* options,
+                               uint8_t* option_count) {
+    *option_count = 0;
+    OptionPriority_t priorities[MAX_AGENT_DISPLAY_OPTIONS] = {0};
+    
+    // Always available baseline options
+    add_option_if_space(&options, option_count, &priorities, 
+                       "Just chat", ACTION_CHAT, PRIORITY_ALWAYS, state, history);
+    
+    // Dynamic request options based on escalation state
+    generate_time_decrease_options(state, history, &options, option_count, &priorities);
+    generate_time_increase_options(state, history, &options, option_count, &priorities);
+    generate_unlock_options(state, history, &options, option_count, &priorities);
+    generate_break_options(state, history, &options, option_count, &priorities);
+    generate_game_options(state, history, &options, option_count, &priorities);
+    
+    // Agent-initiated options (proactive offers)
+    generate_proactive_options(state, history, profile, &options, option_count, &priorities);
+    
+    // Sort options by priority and relationship context
+    sort_options_by_priority(options, priorities, *option_count);
+}
+
+void generate_time_decrease_options(AgentRuntimeState_t* state, 
+                                  EnhancedRequestHistory_t* history,
+                                  AgentOptionEntry_t** options, 
+                                  uint8_t* option_count,
+                                  OptionPriority_t** priorities) {
+    
+    uint8_t escalation = history->escalation_level[REQUEST_TYPE_DECREASE_TIME];
+    uint8_t denials = history->consecutive_denials[REQUEST_TYPE_DECREASE_TIME];
+    
+    // Tier 1: Polite request (always available if not on cooldown)
+    if (can_request(REQUEST_DECREASE_TIME_POLITE, history)) {
+        add_option_if_space(options, option_count, priorities,
+                           "Ask politely for less time", 
+                           ACTION_REQUEST_DECREASE_TIME_POLITE,
+                           PRIORITY_NORMAL, state, history);
+    }
+    
+    // Tier 2: Earnest plea (available after denial)
+    if (denials >= 1 && can_request(REQUEST_DECREASE_TIME_PLEA, history)) {
+        add_option_if_space(options, option_count, priorities,
+                           "Plead earnestly for time reduction", 
+                           ACTION_REQUEST_DECREASE_TIME_PLEA,
+                           PRIORITY_HIGH, state, history);
+    }
+    
+    // Tier 3: Desperate begging (available after multiple denials)
+    if (denials >= 2 && can_request(REQUEST_DECREASE_TIME_DESPERATE, history)) {
+        add_option_if_space(options, option_count, priorities,
+                           "Beg desperately for any reduction", 
+                           ACTION_REQUEST_DECREASE_TIME_DESPERATE,
+                           PRIORITY_DESPERATE, state, history);
+    }
+    
+    // Trust-gated negotiation (high trust required)
+    if (state->trust_level >= 60 && can_request(REQUEST_DECREASE_TIME_NEGOTIATE, history)) {
+        add_option_if_space(options, option_count, priorities,
+                           "Negotiate time reduction", 
+                           ACTION_REQUEST_DECREASE_TIME_NEGOTIATE,
+                           PRIORITY_TRUST_EXCLUSIVE, state, history);
+    }
+}
+
+void generate_proactive_options(AgentRuntimeState_t* state, 
+                              EnhancedRequestHistory_t* history,
+                              const AgentProfile_t* profile,
+                              AgentOptionEntry_t** options, 
+                              uint8_t* option_count,
+                              OptionPriority_t** priorities) {
+    
+    // Agent offers based on high affection
+    if (state->affection_level > 75 && should_agent_offer_bonus(state, history)) {
+        add_option_if_space(options, option_count, priorities,
+                           "Accept agent's time bonus offer", 
+                           ACTION_ACCEPT_AGENT_BONUS,
+                           PRIORITY_AGENT_OFFER, state, history);
+    }
+    
+    // Agent challenges based on trust and game history
+    if (state->trust_level > 60 && history->games_won_total > 3) {
+        add_option_if_space(options, option_count, priorities,
+                           "Accept special game challenge", 
+                           ACTION_ACCEPT_SPECIAL_CHALLENGE,
+                           PRIORITY_SPECIAL_CONTENT, state, history);
+    }
+    
+    // Agent relationship milestone options
+    if (has_new_milestone_available(state, history)) {
+        add_option_if_space(options, option_count, priorities,
+                           "Explore relationship milestone", 
+                           ACTION_RELATIONSHIP_MILESTONE,
+                           PRIORITY_MILESTONE, state, history);
+    }
+}
+
+// Priority-based option filtering ensures most relevant options are shown
+typedef enum {
+    PRIORITY_ALWAYS = 100,          // Core options always available
+    PRIORITY_AGENT_OFFER = 90,      // Agent-initiated offers
+    PRIORITY_TRUST_EXCLUSIVE = 85,  // High-trust special options
+    PRIORITY_SPECIAL_CONTENT = 80,  // Unlocked special content
+    PRIORITY_MILESTONE = 75,        // Relationship milestones
+    PRIORITY_DESPERATE = 70,        // Escalated desperate requests
+    PRIORITY_HIGH = 60,             // High-priority requests
+    PRIORITY_NORMAL = 50,           // Standard requests
+    PRIORITY_LOW = 30,              // Low-priority or discouraged options
+    PRIORITY_HIDDEN = 0             // Should not be shown
+} OptionPriority_t;
+```
+
+#### 5.7.2 Context-Sensitive Option Text
+Options dynamically change their display text based on agent mood and relationship state:
+
+```c
+const char* get_contextual_option_text(DetailedRequestType_t request_type,
+                                      AgentRuntimeState_t* state,
+                                      EnhancedRequestHistory_t* history) {
+    
+    switch(request_type) {
+        case REQUEST_DECREASE_TIME_POLITE:
+            if (state->affection_level > 70) {
+                return "Ask sweetly for less time";
+            } else if (state->strictness_level > 70) {
+                return "Carefully request time reduction";
+            } else {
+                return "Ask politely for less time";
+            }
+            
+        case REQUEST_GAME_BASIC:
+            if (state->affection_level > 80) {
+                return "Suggest playing together";
+            } else if (history->games_won_total > 5) {
+                return "Challenge to another game";
+            } else {
+                return "Ask to play a game";
+            }
+            
+        case REQUEST_BREAK_STANDARD:
+            if (history->consecutive_denials[REQUEST_TYPE_BREAK] > 0) {
+                return "Try asking for break again";
+            } else if (state->trust_level > 60) {
+                return "Request personal time";
+            } else {
+                return "Ask for hygiene break";
+            }
+    }
+    
+    return get_default_option_text(request_type);
+}
+```
+
+#### 5.7.3 Agent-Responsive Option Evolution
+Options change based on agent's most recent response to create natural conversation flow:
+
+```c
+void update_options_after_agent_response(EnhancedAgentDecision_t last_decision,
+                                        DetailedRequestType_t last_request,
+                                        AgentRuntimeState_t* state,
+                                        EnhancedRequestHistory_t* history) {
+    
+    switch(last_decision) {
+        case DECISION_MAYBE_LATER:
+            // Add "ask when later might be" option
+            enable_followup_option(ACTION_ASK_WHEN_LATER, 300); // 5 min availability
+            break;
+            
+        case DECISION_CONDITIONAL_GRANT:
+            // Add promise-related options
+            enable_followup_option(ACTION_ACCEPT_CONDITIONS, 0);
+            enable_followup_option(ACTION_NEGOTIATE_CONDITIONS, 0);
+            break;
+            
+        case DECISION_REJECT_GENTLE:
+            // Add gratitude and understanding options
+            enable_followup_option(ACTION_THANK_FOR_EXPLANATION, 60);
+            enable_followup_option(ACTION_ASK_FOR_ALTERNATIVE, 120);
+            break;
+            
+        case DECISION_GRANT_ENTHUSIASTIC:
+            // Add appreciation and relationship-building options
+            enable_followup_option(ACTION_EXPRESS_GRATITUDE, 0);
+            enable_followup_option(ACTION_OFFER_SOMETHING_BACK, 0);
+            break;
+    }
+}
+```
+
+`ApplicationLogic_Task` will prepare the list of options (text labels and associated action IDs) and send a command to `Display_Task` to update this UI component. This will use a command like `CMD_UPDATE_AGENT_OPTIONS`, with a payload defined as follows (this definition should also be in `Doccumentation/Inter_Task_Communication_ICD.txt`):
+
+```c
+// To be defined in a shared header (e.g., display_interface.h or agent_interface.h)
+#define MAX_AGENT_DISPLAY_OPTIONS 4 // Example maximum number of options shown at once
+
+typedef struct {
+    const char* option_text;      // Text to display for the option
+    uint16_t    action_id;        // Opaque ID meaningful to ApplicationLogic_Task for this action
+} AgentOptionEntry_t;
+
+typedef struct {
+    uint8_t num_options;                                // Actual number of options to display
+    AgentOptionEntry_t options[MAX_AGENT_DISPLAY_OPTIONS]; // Array of options
+} DisplayCmdAgentOptionsPayload_t;
+
+// Then, in ApplicationLogic_Task, when sending to Display_Task:
+// DisplayCommand cmd;
+// cmd.id = CMD_UPDATE_AGENT_OPTIONS;
+// cmd.data.agent_options_payload.num_options = actual_option_count;
+// for (i=0; i < actual_option_count; ++i) {
+//     cmd.data.agent_options_payload.options[i].option_text = "Some text";
+//     cmd.data.agent_options_payload.options[i].action_id = SOME_ACTION_ID_ENUM;
+// }
+// xQueueSend(display_task_queue_handle, &cmd, ...);
+```
+
+## 6. Request Interaction Patterns
+The Agent System implements sophisticated patterns for handling user requests over time.
+
+### 6.1 Request Flow State Machine
+Each request follows a state flow:
+```
+[User Selects Request] → [Check Cooldown] → [Evaluate Rules] → [Calculate Probability] 
+    ↓                         ↓                    ↓                      ↓
+[Show Options]          [Show Cooldown Msg]  [Auto-Reject]         [Make Decision]
+                                                                         ↓
+                                                                  [Grant] or [Deny]
+                                                                         ↓
+                                                                  [Update Mood & History]
+                                                                         ↓
+                                                                  [Show Response Dialog]
+```
+
+### 6.2 Progressive Request Strategies
+Users can employ different strategies with varying effectiveness:
+
+#### 6.2.1 The Persistent Beggar
+- Repeatedly requests same thing
+- Effectiveness decreases with each attempt
+- Can trigger "request timeout" where agent stops responding
+- Recovery requires good behavior or time
+
+#### 6.2.2 The Negotiator
+- Varies request types strategically
+- Builds trust with increase time requests
+- Uses earned goodwill for other requests
+- Most effective long-term strategy
+
+#### 6.2.3 The Promise Maker
+- Combines requests with promises
+- Higher grant rates but severe trust penalties if broken
+- Requires high base trust to unlock
+- Can lead to special "trust bond" relationship
+
+### 6.3 Request Memory System
+Agents remember request patterns:
+```c
+typedef struct {
+    uint16_t total_requests[REQUEST_TYPE_COUNT];      // Lifetime totals
+    uint8_t  grants[REQUEST_TYPE_COUNT];              // Successful grants
+    uint8_t  recent_pattern[8];                       // Last 8 requests (circular buffer)
+    uint8_t  pattern_index;                           // Current position in pattern
+    uint32_t last_spam_timestamp;                     // When user last spammed
+    uint8_t  trust_violations;                        // Broken promises count
+} RequestMemory_t;
+
+// Pattern detection
+RequestPattern detect_pattern(RequestMemory_t* memory) {
+    // Check for spam (3+ same requests in last 5)
+    // Check for negotiation (varied requests)
+    // Check for manipulation (specific sequences)
+    // Return pattern type for special handling
+}
+```
+
+### 6.4 Special Request Combinations
+Some request sequences unlock special interactions:
+
+#### 6.4.1 Trust Building Sequence
+1. Ask to increase time (builds trust)
+2. Complete the extended time
+3. Thank agent
+4. Unlock: "Trusted User" status - better grant rates
+
+#### 6.4.2 Emergency Protocol
+1. Build trust > 80
+2. Never abuse emergency unlock
+3. Use sparingly with valid reasons
+4. Unlock: "Emergency Contact" - instant unlock available once per week
+
+#### 6.4.3 Game Master Path
+1. Play games regularly
+2. Win consistently (>70% win rate)
+3. Never refuse offered games
+4. Unlock: "Game Master" - access to special challenge games
+
+## 7. Interface with `ApplicationLogic_Task` State Machine
+The Agent System is tightly integrated with the main state machine of `ApplicationLogic_Task`.
+
+### 7.1 Agent Interaction State
+- A dedicated state (or a group of substates) like `STATE_AGENT_INTERACTION` exists in the `ApplicationLogic_Task`'s FSM.
+- **Entry:**
+    - User selects an agent from a menu when the device is unlocked.
+    - Agent might proactively initiate interaction based on a timer or event (less common, needs careful design to not be annoying).
+- **Exit:**
+    - User explicitly chooses to exit the interaction (e.g., "Back" button).
+    - Agent ends the conversation (e.g., "Talk to you later.").
+    - A lock condition is met/changed externally, overriding the interaction.
+    - Timeout if user is unresponsive.
+
+### 7.2 Event Handling within Agent Interaction State
+When `ApplicationLogic_Task` is in `STATE_AGENT_INTERACTION`:
+- **User Input Events:** Button presses (D-Pad for navigation, A for select, B for back) are received by `HardwareService_Task`, notified to `ApplicationLogic_Task`. If in `STATE_AGENT_INTERACTION`, these are routed to the Agent System logic to process user selections from the `Agent Interaction Selector`.
+- **Internal Agent Events:**
+    - Mood dimension changes: Trigger dialog/behavior updates
+    - Agent decision made: Leads to new dialog and/or changes in user options
+    - Mood drift timer: Updates dimensions toward base values
+- **Timer Events:** Can be used for:
+    - Agent-initiated dialog prompts after a period of silence
+    - Time-limited user responses
+    - Mood dimension drift over time
+    - These timers are standard FreeRTOS timers managed by `ApplicationLogic_Task`
+
+### 7.3 Communication with Other `ApplicationLogic_Task` Modules
+- **Lock System Module:**
+    - Agent System queries Lock System for `total_accumulated_lock_time` for the current agent's lock type
+    - Agent decisions might lead to requests to the Lock System (e.g., "initiate early unlock if conditions met," "start cleaning break"). The Lock System retains final authority on lock state changes
+- **Game System Module:**
+    - Agent can decide to offer a game to the user. This involves transitioning `ApplicationLogic_Task` to a game state or invoking Game System functions
+    - Game outcomes (win/loss, score) are reported back to the Agent System to influence mood dimensions
+
+## 8. Agent Personalities and Content
+As per `architecture.txt`, three initial agents are planned: Beginner, Advanced, Permanent.
+
+### 8.1 Defining Agent Personalities in `AgentProfile_t`
+Using the 4-dimensional mood system, each agent has distinct baseline values and volatilities:
+
+- **Beginner (Rookie):**
+  - `base_strictness`: 20 (Very lenient with rules)
+  - `base_affection`: 75 (Warm and encouraging)
+  - `base_patience`: 80 (Very patient)
+  - `base_trust`: 60 (Moderately trusting)
+  - `strictness_volatility`: 30 (Slow to become strict)
+  - `affection_volatility`: 50 (Moderate emotional changes)
+  - `patience_volatility`: 40 (Fairly stable patience)
+  - `trust_volatility`: 15 (Very slow trust changes)
+  - Dialogs are simpler, more encouraging, focuses on positive reinforcement
+
+- **Advanced (Veteran):**
+  - `base_strictness`: 50 (Balanced rule enforcement)
+  - `base_affection`: 50 (Professional but friendly)
+  - `base_patience`: 50 (Average patience)
+  - `base_trust`: 40 (Cautiously trusting)
+  - `strictness_volatility`: 60 (Moderately responsive)
+  - `affection_volatility`: 70 (More emotionally dynamic)
+  - `patience_volatility`: 80 (Patience varies with situation)
+  - `trust_volatility`: 20 (Moderate trust changes)
+  - Dialogs are more complex, behavior less predictable, challenges the user
+
+- **Permanent (Warden):**
+  - `base_strictness`: 85 (Very strict with rules)
+  - `base_affection`: 25 (Cold and professional)
+  - `base_patience`: 30 (Limited patience)
+  - `base_trust`: 20 (Highly suspicious)
+  - `strictness_volatility`: 20 (Rarely deviates from strict)
+  - `affection_volatility`: 30 (Emotionally stable/distant)
+  - `patience_volatility`: 90 (Patience drops quickly)
+  - `trust_volatility`: 10 (Extremely slow to trust)
+  - Dialogs are terse, focused on the lock, minimal interaction
+
+These traits in `AgentProfile_t` directly feed into the Mood Engine and Decision Logic algorithms.
+
+### 8.2 Image Assets
+- As described in `architecture.txt` (Sec 4.2.1) and `Doccumentation/Asset_Pipeline_Guide.txt`, images are PBMs converted to XBM C arrays
+- Each agent profile (`AgentProfile_t.mood_images_ref`) links to its set of mood-specific images
+- `ApplicationLogic_Task` (Agent System) uses the `agent_select_mood_image()` function (see Section 3.6) to choose the appropriate image based on current mood dimensions
+- A command (e.g., `CMD_UPDATE_IMAGE_ELEMENT`) is sent to `Display_Task`, containing the pointer or ID to the XBM C array data in Flash
+    ```c
+    // In ApplicationLogic_Task:
+    const unsigned char* mood_image = agent_select_mood_image(
+        &agent_state, agent_profile->mood_images_ref);
+    
+    DisplayCommand cmd;
+    cmd.id = CMD_UPDATE_IMAGE_ELEMENT;
+    cmd.data.update_image.screen_id = SCREEN_ID_AGENT_INTERACTION;
+    cmd.data.update_image.element_id = ELEMENT_ID_AGENT_VISUAL;
+    cmd.data.update_image.image_ptr = mood_image;
+    xQueueSend(display_task_queue_handle, &cmd, ...);
+    ```
+
+### 8.3 Dialog Content Management
+- Dialog text is created per agent, reflecting mood dimension combinations and context
+- Content should reflect the agent's personality and current mood state
+
+#### 8.3.1 General Mood-Based Dialogs
+- Beginner (High Affection, Low Strictness): "Hey there! Ready for another great locked session?"
+- Beginner (Low Patience, High Affection): "I love you, but please, give me a moment?"
+- Beginner (High Trust): "I believe in you! You've always kept your word with me."
+- Advanced (Medium all): "Let's see how you handle today's challenge."
+- Advanced (Low Trust): "You'll need to prove yourself before I consider that request."
+- Advanced (High Trust, Medium Strictness): "I trust you, but we still need to follow some rules."
+- Permanent (High Strictness, Low Affection): "Denied. Time remaining is fixed."
+- Permanent (Low Patience): "No. Stop asking. Now."
+- Permanent (Very Low Trust): "I don't believe a word you're saying. Request denied."
+- Any agent (Complete Trust): "You've earned my complete trust. What do you need?"
+
+#### 8.3.2 Request-Specific Dialog Examples
+
+**Beg to Decrease Time - Responses:**
+- Beginner (Grant): "Okay, just this once! I'll take off 30 minutes. You're doing great!"
+- Beginner (Deny): "I know it's tough, but you can do this! Stay strong!"
+- Advanced (Grant): "Fine. 15 minutes off. Don't make me regret this."
+- Advanced (Deny): "Nice try, but we both know you need this time."
+- Permanent (Always Deny): "Absolutely not. The time was set for a reason."
+
+**Ask to Increase Time - Responses:**
+- Beginner (Grant): "Wow! I'm so proud of you! Adding an hour. You're amazing!"
+- Advanced (Grant): "Impressive dedication. One hour added. Keep it up."
+- Permanent (Grant): "Acceptable. Duration extended by one hour."
+- Any (Special High Trust): "Your commitment continues to impress me. How much time would you like?"
+
+**Beg for Early Unlock - Responses:**
+- Beginner (Deny): "I really wish I could, but that defeats the whole purpose!"
+- Advanced (Deny): "Not happening. You knew what you signed up for."
+- Permanent (Deny): "Request denied. No exceptions."
+- Any (Emergency Grant, Trust>80): "This is highly irregular... but I trust you. Unlocking now."
+
+**Beg for Cleaning Break - Responses:**
+- Beginner (Grant): "Of course! Take 10 minutes. I'll be waiting right here!"
+- Advanced (Grant): "5 minutes. Don't be late or there will be consequences."
+- Permanent (Grant): "3 minutes. Starting now."
+- Any (Deny, Recent Break): "You just had a break. You'll have to wait."
+
+**Ask to Play Game - Responses:**
+- Beginner (Grant): "Yay! I love playing games with you! Let's have fun!"
+- Advanced (Grant): "Alright, but I won't go easy on you."
+- Permanent (Deny): "Games are a distraction. Focus on your task."
+- Any (High Trust Grant): "You've earned a special challenge. Ready?"
+
+#### 8.3.3 Enhanced Request-Response Dialog Patterns
+
+**Escalating Request Dialogs:**
+
+*Time Decrease - Tier 1 Polite Request:*
+- Beginner (Grant): "Well, since you asked so nicely... I'll take off 20 minutes!"
+- Beginner (Deny): "I appreciate you being polite, but I think you need this time."
+- Advanced (Grant): "Your politeness is noted. 15 minutes removed."
+- Permanent (Deny): "Polite request acknowledged and denied."
+
+*Time Decrease - Tier 2 Earnest Plea:*
+- Beginner (Grant): "Your reasoning is actually quite good. Okay, 10 minutes off."
+- Beginner (Deny): "I can see you really want this, but trust the process."
+- Advanced (Grant): "Fine. Your passion is convincing. 5 minutes off."
+- Advanced (Deny): "Nice try, but begging won't change the fundamentals here."
+- Permanent (Deny): "Emotional appeals are irrelevant. Request denied."
+
+*Time Decrease - Tier 3 Desperate Begging:*
+- Beginner (Deny, Patience Warning): "Hey, hey... breathe. I know it's hard, but please don't panic."
+- Advanced (Deny, Stern): "This desperation isn't helping your case. Compose yourself."
+- Permanent (Deny, Cold): "This behavior is unacceptable. Further outbursts will be ignored."
+
+**Trust-Exclusive Dialogs:**
+
+*Honor System Unlock (Trust >85):*
+- Any Agent: "You know what? I trust you completely. If you truly need out, I believe you. Unlocking now."
+
+*Negotiation Mode (Trust >60):*
+- Beginner: "Let's talk this through. What's your reasoning, and what can we work out?"
+- Advanced: "Alright, you've earned a seat at the negotiation table. Make your case."
+- Permanent: "Your track record allows for discussion. Present your argument."
+
+**Proactive Agent Dialogs:**
+
+*High Affection Spontaneous Offers:*
+- Beginner: "You're being so wonderful today! Would you like me to add an extra hour as a reward?"
+- Advanced: "Your dedication impresses me. I'm offering you a special bonus challenge."
+- Permanent: "Acceptable performance warrants acknowledgment. Benefit authorized."
+
+*Low Patience Warnings:*
+- Beginner: "I'm feeling a bit overwhelmed right now. Could we keep things simple for a while?"
+- Advanced: "My patience is running thin. I suggest giving me some space."
+- Permanent: "Patience levels critical. Interaction minimization recommended."
+
+*Trust Milestone Celebrations:*
+- Any Agent (reaching 70+ trust): "We've built something really special here. I want to share something with you..."
+- Any Agent (reaching 90+ trust): "You've earned my complete trust. Welcome to the inner circle."
+
+**Context-Responsive Continuation Dialogs:**
+
+*After "Maybe Later" Response:*
+- User option appears: "Ask when later might be"
+- Agent response: "Let me see... if you can wait quietly for 30 minutes, I might reconsider."
+
+*After Conditional Grant:*
+- User options: "Accept conditions" / "Negotiate conditions"
+- Agent (Accept): "Smart choice. I'm glad we understand each other."
+- Agent (Negotiate): "Trying to change the terms already? That's... actually clever."
+
+*After Relationship Milestone:*
+- User option: "Explore relationship milestone"
+- Agent: "We've come so far together. I have something special to show you..."
+
+**Cooldown and Repeated Request Evolution:**
+- First Cooldown: "You just asked that. Give it some time." → "Try asking for break again"
+- Second Cooldown: "I said wait. Patience, please." → "Carefully request time reduction"
+- Third Consecutive Denial: "If you ask one more time, I'm done talking for a while." → "Beg desperately for any reduction"
+- Request Timeout Active: "..." (No response, limited options available)
+- After Good Behavior: "That's better. What can I help you with?" → Full options restored
+
+## 9. Integration with Display_Task (Summary)
+`ApplicationLogic_Task`'s Agent System communicates with `Display_Task` via its message queue (`display_task_queue_handle`):
+- **`CMD_ACTIVATE_SCREEN { SCREEN_ID_AGENT_INTERACTION, AgentUIData* data }`**: To switch to the agent interaction screen, potentially passing initial data
+- **`CMD_UPDATE_TEXT_ELEMENT { SCREEN_ID_AGENT_INTERACTION, ELEMENT_ID_AGENT_DIALOG, char* text }`**: Displays the agent's current dialog line
+- **`CMD_UPDATE_IMAGE_ELEMENT { SCREEN_ID_AGENT_INTERACTION, ELEMENT_ID_AGENT_VISUAL, const unsigned char* xbm_ptr }`**: Shows the agent's current mood image based on mood dimensions
+- **`CMD_UPDATE_AGENT_OPTIONS { SCREEN_ID_AGENT_INTERACTION, ELEMENT_ID_AGENT_SELECTOR, DisplayCmdAgentOptionsPayload_t* payload }`**: Populates the `Agent Interaction Selector` UI component with user choices, using the structure defined in section 5.4
+
+`Display_Task` is responsible for rendering these elements using U8g2 via BSP, as detailed in `Doccumentation/UI_System_Design.txt`.
+
+## 10. Persistence of Agent State
+- The `AgentRuntimeState_t` (containing mood dimensions, `interaction_flags`, trust tracking, etc.) is critical for continuity
+- `ApplicationLogic_Task` requests `HardwareService_Task` (via its message queue) to save this data to EEPROM emulation
+- **When to Save:**
+    - After any mood dimension changes by >10 points
+    - After any trust change (trust is too important to lose)
+    - After 5 cumulative mood changes without saving
+    - Before `ApplicationLogic_Task` signals the system to enter a low-power state
+    - At the end of an agent interaction session
+    - After significant events (game completion, break violation)
+    - When promises are made or resolved (kept/broken)
+- **When to Load:**
+    - When the user selects an agent to interact with
+    - Upon system startup, if an agent was active during the last session
+- **Special Trust Persistence:**
+    - Trust level is always preserved between sessions
+    - Promise tracking counters are reset per session
+    - Total trust events counter is lifetime persistent
+
+The Storage service within `HardwareService_Task` handles the actual EEPROM R/W operations.
+
+## 11. Error Handling & Edge Cases
+- **Missing Assets:** If an image or dialog ID is invalid, display a default placeholder image/text and log an error
+- **EEPROM Failure:** If `AgentRuntimeState_t` cannot be loaded, initialize with agent's base mood values. If saving fails, log error; the agent might revert to a previous state on next load
+- **Rapid Interactions:** Debounce or limit interaction frequency to prevent mood dimension swings from too-quick inputs
+- **Mood Dimension Bounds:** Always clamp mood values to 0-100 range to prevent overflow/underflow
+- **Trust-Specific Edge Cases:**
+  - If trust level corrupts (outside 0-100), reset to agent's base trust
+  - Promise tracking overflow: Cap at 255 promises per session
+  - Trust changes during critical operations are queued and applied after
+  - Negative trust events (broken promises) are always processed even in low-power states
+
+## 12. Future Considerations
+- **Sound Effects:** Add simple sound cues for mood changes or important dialogs (would require integration with a sound module in `HardwareService_Task`)
+- **More Complex History:** Implement a more detailed interaction log if nuanced long-term memory is desired (consider RAM/Flash impact)
+- **Agent-Specific Goals/Quests:** Agents could have simple objectives for the user to complete, influencing mood or granting rewards
+- **Mood Dimension Interactions:** Future versions might implement interactions between dimensions (e.g., very low patience automatically reduces affection, high trust increases patience)
+- **Trust Networks:** Agents could share trust information (e.g., if user breaks trust with one agent, others become more suspicious)
+- **Trust Decay:** Optional slow trust decay over very long periods of non-interaction
+- **Localization:** Storing and selecting dialog text for multiple languages would require significant changes to the dialog system
+
+This document details the agent interaction logic within ApplicationLogic_Task, featuring a 4-dimensional mood system (strictness, affection, patience, trust) that creates rich, dynamic agent personalities. The trust dimension adds depth by enabling special behaviors, gating advanced features, and creating meaningful long-term relationships between users and agents. The system manages agent states, dialog selection, decision-making, and visual representation through coordinated interaction with Display_Task.

@@ -1,0 +1,1 @@
+This document will expand on the project's testing and quality assurance strategy. It will detail unit testing (Unity, FFF mocking), integration testing, HIL testing plans, static analysis tool usage, code coverage metrics, and test case design principles. 
