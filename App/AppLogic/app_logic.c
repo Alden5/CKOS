@@ -125,6 +125,13 @@ void app_logic_process_button_event(const bsp_button_event_t* event) {
         return; // Only process button press events, not releases
     }
     
+    // Button debouncing - ignore rapid button presses
+    #define BUTTON_DEBOUNCE_MS 150
+    if (g_app_state.last_button == event->button && 
+        (event->timestamp - g_app_state.last_button_time) < BUTTON_DEBOUNCE_MS) {
+        return; // Ignore this button press (too soon after last one)
+    }
+    
     printf("Button pressed: %d in state %s\n", event->button, 
            app_logic_get_state_name(g_app_state.current_state));
     

@@ -289,6 +289,20 @@ void ui_component_draw_confirmation_dialog(const char* title, const char* messag
                                            const char* ok_text, const char* cancel_text,
                                            bool ok_selected);
 
+// =============================================================================
+// NEW STANDARDIZED UI FRAMEWORK
+// =============================================================================
+
+// Standard screen layout components
+void ui_draw_standard_title_bar(const char* title, float battery_percent);
+void ui_draw_button_hints(const char* primary_action, const char* secondary_action);
+void ui_draw_centered_content(const char* line1, const char* line2, const char* line3);
+void ui_draw_menu_list(const char* items[], int count, int selected, int visible_start, int max_visible);
+
+// Specialized screen layouts
+void ui_draw_lock_status_display(int hours, int minutes, const char* agent_name, const char* mood);
+void ui_draw_agent_selection_list(const char* agents[], const char* descriptions[], int count, int selected);
+
 #ifdef __cplusplus
 }
 #endif

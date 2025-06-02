@@ -189,28 +189,14 @@ bool display_task_send_command(DisplayCommand* cmd) {
 // =============================================================================
 
 void display_screen_welcome(void) {
-    // Enhanced welcome screen with better visual hierarchy
+    // NEW STANDARDIZED WELCOME SCREEN
+    ui_draw_standard_title_bar("CKOS v2.0", 85.0f);
     
-    // Main border frame with better spacing
-    bsp_display_draw_box(5, 5, 118, 54);
+    // Clean, centered welcome content
+    ui_draw_centered_content("Welcome to", "Chastity Key OS", "System Ready");
     
-    // Header section with brand styling
-    bsp_display_draw_box(10, 10, 108, 28);
-    
-    // Large, centered "CKOS" branding
-    bsp_display_draw_text_centered(15, "CKOS");
-    bsp_display_draw_text_centered(23, "Chastity Key OS");
-    bsp_display_draw_text_centered(31, "Version 2.0");
-    
-    // Separator line
-    bsp_display_draw_line(10, 40, 118, 40);
-    
-    // Welcome message
-    bsp_display_draw_text_centered(45, "Welcome");
-    bsp_display_draw_text_centered(53, "Press any key");
-    
-    // Status indicator at bottom
-    ui_component_draw_input_hints("System Ready - First Boot Setup");
+    // Clear action hint
+    ui_draw_button_hints("Continue", NULL);
 }
 
 void display_screen_timezone_setup(TimezoneScreenData* data) {
@@ -256,30 +242,20 @@ void display_screen_time_setup(TimeScreenData* data) {
 }
 
 void display_screen_main_menu(MenuScreenData* data) {
-    // Enhanced main menu with better styling
-    ui_component_draw_title_bar("Main Menu");
-    
-    // Menu border frame with better spacing
-    bsp_display_draw_box(8, 16, 112, 35);
+    // NEW STANDARDIZED MAIN MENU
+    ui_draw_standard_title_bar("Main Menu", 85.0f);
     
     if (data && data->options && data->menu_selection < data->max_items) {
-        // Scrolling menu with improved spacing
-        ui_component_draw_scrolling_menu(data->options, data->max_items, 
-                                       data->menu_selection, data->visible_start, 
-                                       data->max_visible);
-        
-        // Enhanced position indicator with border
-        char position_text[16];
-        snprintf(position_text, sizeof(position_text), "%d/%d", 
-                 data->menu_selection + 1, data->max_items);
-        bsp_display_draw_text_centered(54, position_text);
+        // Clean menu list with standardized layout
+        ui_draw_menu_list(data->options, data->max_items, data->menu_selection, 
+                         data->visible_start, data->max_visible);
     } else {
-        // Default display when data is invalid
-        bsp_display_draw_text_centered(30, "No menu data");
+        // Error state with centered message
+        ui_draw_centered_content("No menu data", "available", NULL);
     }
     
-    // Input hints
-    ui_component_draw_input_hints("^v: Move  A: Select");
+    // Consistent button hints
+    ui_draw_button_hints("Select", "Settings");
 }
 
 void display_screen_settings(SettingsScreenData* data) {
@@ -401,41 +377,27 @@ void ui_component_draw_input_hints(const char* hints) {
 // =============================================================================
 
 void display_screen_agent_selection(AgentSelectionScreenData* data) {
-    ui_component_draw_title_bar("Select Agent");
+    // NEW STANDARDIZED AGENT SELECTION
+    ui_draw_standard_title_bar("Select Agent", 85.0f);
     
     if (!data) {
-        bsp_display_draw_text_centered(30, "No agent data");
-        ui_component_draw_input_hints("^v: Select Agent  A: Confirm  B: Back");
+        ui_draw_centered_content("No agent data", "available", NULL);
+        ui_draw_button_hints(NULL, "Back");
         return;
     }
     
-    // Agent cards layout - 3 agents stacked vertically
+    // Clean agent list with descriptions
     const char* agent_names[] = {"Rookie", "Veteran", "Warden"};
     const char* agent_descriptions[] = {
-        "Beginner-friendly, High affection",
-        "Balanced experience, Moderate",
-        "Strict mode, High strictness"
+        "Friendly & Supportive",
+        "Balanced Experience", 
+        "Strict & Demanding"
     };
     
-    int card_height = 12;
-    int start_y = 16;
+    ui_draw_agent_selection_list(agent_names, agent_descriptions, 3, data->selected_agent);
     
-    for (int i = 0; i < 3; i++) {
-        int y = start_y + i * card_height;
-        bool selected = (i == data->selected_agent);
-        
-        ui_component_draw_agent_selection_card(15, y, 98, card_height - 2,
-                                               agent_names[i], 
-                                               agent_descriptions[i], 
-                                               selected);
-    }
-    
-    // Show selection position
-    char position_text[16];
-    snprintf(position_text, sizeof(position_text), "%d/3", data->selected_agent + 1);
-    bsp_display_draw_text_centered(52, position_text);
-    
-    ui_component_draw_input_hints("^v: Select Agent  A: Confirm  B: Back");
+    // Clear navigation hints
+    ui_draw_button_hints("Choose Agent", "Back");
 }
 
 void display_screen_agent_interaction(AgentInteractionScreenData* data) {
@@ -476,47 +438,28 @@ void display_screen_agent_interaction(AgentInteractionScreenData* data) {
 }
 
 void display_screen_lock_status(LockStatusScreenData* data) {
-    ui_component_draw_title_bar("Lock Status");
+    // NEW STANDARDIZED LOCK STATUS
+    ui_draw_standard_title_bar("Lock Status", data ? data->battery_percentage : 85.0f);
     
     if (!data) {
-        bsp_display_draw_text_centered(30, "No status data");
-        ui_component_draw_input_hints("A: Request  B: Menu  Select: Options");
+        ui_draw_centered_content("No lock status", "data available", NULL);
+        ui_draw_button_hints("Request", "Menu");
         return;
     }
     
-    // Lock type and status display
-    char buffer[64];
-    snprintf(buffer, sizeof(buffer), "Type: %s", data->lock_type_name ? data->lock_type_name : "Unknown");
-    bsp_display_draw_text(8, 18, buffer);
-    
-    // Time remaining display (large and prominent)
+    // Convert time to hours and minutes for clean display
     uint32_t hours = data->time_remaining_seconds / 3600;
     uint32_t minutes = (data->time_remaining_seconds % 3600) / 60;
-    uint32_t seconds = data->time_remaining_seconds % 60;
     
-    bsp_display_draw_box(15, 25, 98, 15);
-    snprintf(buffer, sizeof(buffer), "%02lu:%02lu:%02lu", 
-             (unsigned long)hours, (unsigned long)minutes, (unsigned long)seconds);
-    bsp_display_draw_text_centered(30, buffer);
-    bsp_display_draw_text_centered(37, "Time Remaining");
+    // Use specialized lock status display
+    ui_draw_lock_status_display(hours, minutes, data->agent_name, "Content");
     
-    // Session time display
-    uint32_t session_hours = data->session_time_seconds / 3600;
-    uint32_t session_minutes = (data->session_time_seconds % 3600) / 60;
-    snprintf(buffer, sizeof(buffer), "Session: %02lu:%02lu", 
-             (unsigned long)session_hours, (unsigned long)session_minutes);
-    bsp_display_draw_text(8, 44, buffer);
-    
-    // Agent name (if applicable)
+    // Context-dependent button hints
     if (data->agent_name) {
-        snprintf(buffer, sizeof(buffer), "Agent: %s", data->agent_name);
-        bsp_display_draw_text(8, 50, buffer);
+        ui_draw_button_hints("Chat with Agent", "Emergency");
+    } else {
+        ui_draw_button_hints("Request", "Emergency");
     }
-    
-    // Battery and status indicators
-    ui_component_draw_battery_indicator(90, 44, data->battery_percentage / 100.0f, false);
-    
-    ui_component_draw_input_hints("A: Interact  B: Menu  Select: Options");
 }
 
 void display_screen_custom_lock_config(CustomLockConfigScreenData* data) {
@@ -848,5 +791,144 @@ void ui_component_draw_confirmation_dialog(const char* title, const char* messag
     }
     if (cancel_text) {
         ui_component_draw_menu_selection(68, 40, 30, 8, cancel_text, !ok_selected);
+    }
+}
+
+// =============================================================================
+// NEW STANDARDIZED UI FRAMEWORK
+// =============================================================================
+
+void ui_draw_standard_title_bar(const char* title, float battery_percent) {
+    // Top title bar with battery indicator (12 pixels high)
+    bsp_display_draw_line(0, 11, BSP_DISPLAY_WIDTH - 1, 11);
+    
+    // Title on left
+    if (title) {
+        bsp_display_draw_text(2, 2, title);
+    }
+    
+    // Battery indicator on right
+    ui_component_draw_battery_indicator(BSP_DISPLAY_WIDTH - 25, 2, battery_percent / 100.0f, false);
+}
+
+void ui_draw_button_hints(const char* primary_action, const char* secondary_action) {
+    // Bottom button hints bar (12 pixels high from bottom)
+    int y = BSP_DISPLAY_HEIGHT - 12;
+    bsp_display_draw_line(0, y, BSP_DISPLAY_WIDTH - 1, y);
+    
+    // Primary action (A button) on left
+    if (primary_action) {
+        char hint[32];
+        snprintf(hint, sizeof(hint), "A: %s", primary_action);
+        bsp_display_draw_text(2, y + 2, hint);
+    }
+    
+    // Secondary action (B button) on right
+    if (secondary_action) {
+        char hint[32];
+        snprintf(hint, sizeof(hint), "B: %s", secondary_action);
+        // Right-align the text
+        int text_width = strlen(hint) * 7; // 6 pixels + 1 space per char
+        int x = BSP_DISPLAY_WIDTH - text_width - 2;
+        bsp_display_draw_text(x, y + 2, hint);
+    }
+}
+
+void ui_draw_centered_content(const char* line1, const char* line2, const char* line3) {
+    // Draw up to 3 lines of centered content in the main content area
+    int content_y_start = 14; // Below title bar
+    int content_height = BSP_DISPLAY_HEIGHT - 14 - 12; // Above button hints
+    int line_height = 10;
+    
+    int total_lines = 0;
+    if (line1) total_lines++;
+    if (line2) total_lines++;
+    if (line3) total_lines++;
+    
+    int start_y = content_y_start + (content_height - (total_lines * line_height)) / 2;
+    
+    if (line1) {
+        bsp_display_draw_text_centered(start_y, line1);
+        start_y += line_height;
+    }
+    if (line2) {
+        bsp_display_draw_text_centered(start_y, line2);
+        start_y += line_height;
+    }
+    if (line3) {
+        bsp_display_draw_text_centered(start_y, line3);
+    }
+}
+
+void ui_draw_menu_list(const char* items[], int count, int selected, int visible_start, int max_visible) {
+    // Draw a scrollable menu list in the content area
+    int content_y_start = 14; // Below title bar
+    int item_height = 10;
+    
+    for (int i = 0; i < max_visible && (visible_start + i) < count; i++) {
+        int item_index = visible_start + i;
+        int y = content_y_start + (i * item_height);
+        bool is_selected = (item_index == selected);
+        
+        // Draw selection indicator
+        if (is_selected) {
+            bsp_display_draw_text(2, y, ">");
+        }
+        
+        // Draw menu item
+        bsp_display_draw_text(12, y, items[item_index]);
+    }
+    
+    // Draw scroll indicators if needed
+    if (visible_start > 0) {
+        // Up arrow
+        bsp_display_draw_text(BSP_DISPLAY_WIDTH - 10, content_y_start, "^");
+    }
+    if (visible_start + max_visible < count) {
+        // Down arrow
+        int arrow_y = content_y_start + (max_visible - 1) * item_height;
+        bsp_display_draw_text(BSP_DISPLAY_WIDTH - 10, arrow_y, "v");
+    }
+}
+
+void ui_draw_lock_status_display(int hours, int minutes, const char* agent_name, const char* mood) {
+    // Specialized display for lock status screen
+    int content_y_start = 16;
+    
+    // Large time display
+    char time_str[16];
+    snprintf(time_str, sizeof(time_str), "%dh %02dm", hours, minutes);
+    bsp_display_draw_text_centered(content_y_start + 5, time_str);
+    bsp_display_draw_text_centered(content_y_start + 15, "remaining");
+    
+    // Agent info
+    if (agent_name && mood) {
+        char agent_str[32];
+        snprintf(agent_str, sizeof(agent_str), "Agent: %s (%s)", agent_name, mood);
+        bsp_display_draw_text_centered(content_y_start + 30, agent_str);
+    }
+}
+
+void ui_draw_agent_selection_list(const char* agents[], const char* descriptions[], int count, int selected) {
+    // Specialized display for agent selection
+    int content_y_start = 14;
+    int item_height = 12; // Larger for descriptions
+    
+    for (int i = 0; i < count; i++) {
+        int y = content_y_start + (i * item_height);
+        bool is_selected = (i == selected);
+        
+        // Selection indicator
+        if (is_selected) {
+            bsp_display_draw_text(2, y, ">");
+        }
+        
+        // Agent name
+        bsp_display_draw_text(12, y, agents[i]);
+        
+        // Description on next line, smaller and indented
+        if (descriptions[i]) {
+            bsp_display_draw_text(16, y + 8, descriptions[i]);
+        }
     }
 }
