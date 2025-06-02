@@ -229,6 +229,132 @@ The BSP's role for U8g2 is:
 
 `Display_Task` directly uses U8g2 APIs for drawing into the U8g2 framebuffer. The BSP is primarily involved in setting up U8g2 with the correct hardware interface functions and then transferring the rendered buffer to the screen.
 
+#### 1.3.3 U8g2 Specifics for ERC12864F7-4 (ST7565R)
+This section details the U8g2 library usage for the specific ERC12864F7-4 display, which uses the ST7565R controller IC. The display resolution is 128x64 pixels.
+
+##### Constructor for ST7565R (ERC12864F7-4)
+For full buffer mode and 4-wire software SPI, the recommended U8g2 constructor is:
+`U8G2_ST7565_ERC12864_F_4W_SW_SPI(u8g2_t *u8g2, const u8x8_pin_t *u8x8_pin_list)`
+
+-   `u8g2_t *u8g2`: Pointer to the U8g2 structure.
+-   `const u8x8_pin_t *u8x8_pin_list`: Defines the MCU pins used for SPI communication (clock, data/MOSI, chip select, data/command) and reset. The order is typically: `clock, data, cs, dc, reset`.
+
+Example pin list definition (actual pins depend on hardware configuration, defined in `bsp_pins.h` or similar):
+```c
+// In bsp_u8g2_hal.c or similar
+// const u8x8_pin_t u8g2_pins[] = {
+//     U8X8_PIN_DEF(U8X8_PIN_SPI_CLOCK, BSP_PIN_DISPLAY_CLK), // Clock
+//     U8X8_PIN_DEF(U8X8_PIN_SPI_DATA,  BSP_PIN_DISPLAY_MOSI),// Data (MOSI)
+//     U8X8_PIN_DEF(U8X8_PIN_CS,        BSP_PIN_DISPLAY_CS),  // Chip Select
+//     U8X8_PIN_DEF(U8X8_PIN_DC,        BSP_PIN_DISPLAY_DC),  // Data/Command
+//     U8X8_PIN_DEF(U8X8_PIN_RESET,     BSP_PIN_DISPLAY_RST), // Reset
+//     U8X8_PIN_NONE                                         // End of list marker
+// };
+// Usage:
+// u8g2_Setup_st7565_erc12864_f_4w_sw_spi(&g_u8g2, U8G2_R0, u8x8_byte_4wire_sw_spi, u8x8_gpio_and_delay_stm32); // Example setup call
+// using the specific setup function for the constructor.
+// Or if using the generic U8g2 constructor:
+// U8G2_ST7565_ERC12864_F_4W_SW_SPI(&g_u8g2, u8g2_pins);
+```
+The `U8G2_R0` parameter in setup functions indicates no rotation. Other options include `U8G2_R1`, `U8G2_R2`, `U8G2_R3` for 90, 180, 270-degree rotations respectively.
+
+##### Communication Protocols and Buffer Options
+U8g2 supports various communication protocols:
+-   **SPI (Serial Peripheral Interface):**
+    -   **Hardware SPI:** Uses dedicated SPI peripherals of the MCU. Generally faster. Constructors often include `HW_SPI`.
+    -   **Software SPI (Bit-Banging):** Implements SPI protocol by manually toggling GPIO pins. Slower but more flexible pin assignment. Constructors often include `SW_SPI`. The example `U8G2_ST7565_ERC12864_F_4W_SW_SPI` uses software SPI.
+-   **I2C (Inter-Integrated Circuit):** A 2-wire protocol. Constructors usually include `I2C` or `2W_HW_I2C`.
+
+Buffer Options:
+-   **Full Buffer (`_F_` in constructor name):**
+    -   U8g2 allocates a buffer in the MCU's RAM that mirrors the entire display content (e.g., 128x64 pixels / 8 bits/byte = 1024 bytes for monochrome).
+    -   Drawing operations write to this RAM buffer.
+    -   The `u8g2_SendBuffer(&g_u8g2)` function transmits the entire buffer to the display.
+    -   **Pros:** Simplifies drawing logic as any pixel can be drawn at any time. Complex graphics are easier to manage.
+    -   **Cons:** Higher RAM usage. For the ERC12864F7-4, this is 1KB. This is the chosen method for CKOS as per `Doccumentation/architecture.txt` (section 4.2).
+-   **Page Buffer (`_1_` or `_2_` in constructor name, e.g., `U8G2_ST7565_ERC12864_1_4W_SW_SPI`):**
+    -   U8g2 allocates a smaller buffer in RAM, typically one or two "pages" of the display. A page's height is usually 8 pixels (1 byte column). For a 128x64 display, one page buffer would be 128x1 bytes = 128 bytes.
+    -   Drawing must be done within a loop structure: `u8g2_FirstPage(&g_u8g2); do { /* drawing commands for current page */ } while (u8g2_NextPage(&g_u8g2));`
+    -   **Pros:** Significantly lower RAM usage.
+    -   **Cons:** More complex drawing logic. Graphics spanning multiple pages need to be redrawn for each page they appear on. Not suitable for animations that require random pixel access across the whole screen without redrawing everything.
+
+##### Example: Initialization and "Hello World" (Full Buffer)
+```c
+// In Display_Task or BSP initialization code
+#include "u8g2.h"
+// Assume BSP provides hardware-specific u8x8_gpio_and_delay and u8x8_byte_4wire_sw_spi
+// And g_u8g2 is defined: static u8g2_t g_u8g2;
+
+// Placeholder for actual BSP pin definitions and U8g2 HAL functions
+extern uint8_t u8x8_gpio_and_delay_stm32(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr);
+extern uint8_t u8x8_byte_4wire_sw_spi(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr);
+
+void Display_Init_HelloWorld_Example(void) {
+    // 1. Setup U8g2 structure with the chosen constructor and hardware interface callbacks.
+    // This specific constructor implicitly defines the display, buffer mode, and SPI mode.
+    // For ST7565_ERC12864_F_4W_SW_SPI, we call its setup function:
+    u8g2_Setup_st7565_erc12864_f_4w_sw_spi(&g_u8g2, U8G2_R0, u8x8_byte_4wire_sw_spi, u8x8_gpio_and_delay_stm32);
+    // The u8x8_gpio_and_delay_stm32 function would internally use a pin list like:
+    // CLK, DATA, CS, DC, RST pins specific to the ST7565_ERC12864_F_4W_SW_SPI constructor needs.
+    // U8g2 HAL layer (u8x8_gpio_and_delay_stm32) must be configured with these pins.
+
+    // 2. Initialize the display controller
+    u8g2_InitDisplay(&g_u8g2);
+
+    // 3. Wake up the display (turn off power save mode)
+    u8g2_SetPowerSave(&g_u8g2, 0);
+
+    // 4. Clear the internal buffer (RAM)
+    u8g2_ClearBuffer(&g_u8g2);
+
+    // 5. Select a font
+    u8g2_SetFont(&g_u8g2, u8g2_font_ncenB08_tr); // Example: 8-pixel high bold font
+
+    // 6. Draw "Hello World" string at position (x=0, y=10)
+    //    The y-coordinate is the baseline of the text.
+    u8g2_DrawStr(&g_u8g2, 0, 10, "Hello World!");
+
+    // 7. Send the buffer content to the physical display
+    u8g2_SendBuffer(&g_u8g2);
+}
+```
+
+##### `firstPage()` / `nextPage()` Loop for Page Buffer Mode
+Although CKOS uses full buffer mode, it's useful to understand the page buffer drawing loop for context or future reference:
+```c
+// Conceptual example for page buffer mode
+void Display_Draw_PageBuffer_Example(void) {
+    // Assume g_u8g2 is initialized with a page buffer constructor (e.g., _1_ variant)
+
+    u8g2_ClearBuffer(&g_u8g2); // Clear the small page buffer in RAM
+
+    u8g2_FirstPage(&g_u8g2);
+    do {
+        // Drawing commands are executed for each page.
+        // U8g2 handles clipping, so you can draw full objects,
+        // and U8g2 will render the part that falls into the current page.
+        u8g2_SetFont(&g_u8g2, u8g2_font_ncenB08_tr);
+        u8g2_DrawStr(&g_u8g2, 0, 10, "Hello Page!"); // This will be drawn repeatedly for each page segment
+                                                  // where the text appears.
+        // Other drawing commands...
+
+    } while (u8g2_NextPage(&g_u8g2));
+    // u8g2_SendBuffer() is called internally by u8g2_NextPage() for each page.
+}
+```
+In page buffer mode, `u8g2_SendBuffer()` is typically not called directly by the user; `u8g2_NextPage()` handles sending each page to the display. All drawing operations must be repeated inside the loop for each page, as the buffer is cleared and redrawn for the display's next segment.
+
+##### Font Usage and Memory Considerations
+-   **Fonts:** U8g2 provides a wide variety of fonts. Fonts are compiled into the firmware and stored in Flash memory.
+    -   Each font has a memory footprint in Flash. Larger fonts or fonts with more characters consume more Flash.
+    -   Choose fonts that fit the display size and readability requirements.
+    -   `u8g2_SetFont(&g_u8g2, chosen_font_name);` sets the active font for subsequent text drawing.
+-   **RAM Usage:**
+    -   **Full Buffer Mode:** The primary RAM consumer is the framebuffer itself. For a 128x64 monochrome display, this is (128 * 64) / 8 = 1024 bytes. This is a significant consideration for MCUs with limited RAM.
+    -   **Page Buffer Mode:** RAM usage is much lower, e.g., 128 bytes for a single page buffer (128x8 pixels) or 256 bytes for a two-page buffer. This makes it suitable for very RAM-constrained devices.
+    -   U8g2 library itself also consumes some RAM for its state variables, but this is generally much smaller than the framebuffer in full buffer mode.
+-   **CKOS Choice:** CKOS uses **full buffer mode** for simpler development and more flexible graphics, accepting the 1KB RAM cost for the framebuffer. This is documented in `Doccumentation/architecture.txt` (section 4.2).
+
 ### 1.4 Framebuffer Management
 As per `Doccumentation/architecture.txt` (section 4.2.1), `Display_Task` manages a full internal display framebuffer. U8g2 itself maintains a framebuffer when operating in full buffer mode.
 
