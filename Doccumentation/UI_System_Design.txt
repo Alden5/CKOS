@@ -505,6 +505,38 @@ General principles:
 - **Responding to Translated Input:** `ApplicationLogic_Task` updates `selected_item_index` in its screen data structure and triggers either a screen redraw (for an instant change) or commands a scroll animation (e.g., `CMD_START_ANIMATION` with type `ANIM_TYPE_PROPERTY_TWEEN`, `animation_id = ANIM_ID_MENU_SCROLL_OFFSET`, and appropriate start/end values for the scroll) to `Display_Task`.
 - **Theme Application:** Font, arrow styles.
 
+### 3.4 Agent Interaction Selector
+- **Description:** List-based menu for presenting dialog or action choices when interacting with an agent. (Details to be elaborated based on `Agent_System_Design.txt`).
+- **Data from `ApplicationLogic_Task`:** Likely similar to `MenuSystemData_t` but specific to agent interactions (e.g., `AgentInteractionMenuData_t`).
+- **Drawing Logic:** To be defined.
+- **Internal State:** Minimal.
+- **Responding to Translated Input:** Driven by `ApplicationLogic_Task`.
+- **Theme Application:** To be defined.
+
+### 3.5 Confirmation Screens
+- **Description:** Standardized layout for displaying messages, statuses (e.g., after key usage), and calls to action.
+- **Data from `ApplicationLogic_Task`:** (e.g., `ConfirmationScreenData_t { char* title; char* message_line1; char* message_line2; ConfirmationType_t type; }`).
+- **Drawing Logic:** To be defined.
+- **Internal State:** None.
+- **Responding to Translated Input:** Driven by `ApplicationLogic_Task` (e.g., for OK/Cancel options if present).
+- **Theme Application:** To be defined.
+
+### 3.6 Identicon Display Element
+- **Description:** Renders the 5x5 Identicon for Keyholder lock connection visualization.
+- **Data from `ApplicationLogic_Task`:** (e.g., `IdenticonData_t { uint8_t pattern[5][5]; }` or a more compact representation).
+- **Drawing Logic:** Renders a 5x5 grid of filled/unfilled squares based on the pattern.
+- **Internal State:** None.
+- **Responding to Translated Input:** Not applicable (static display element).
+- **Theme Application:** Colors for filled/unfilled squares might be themeable.
+
+### 3.7 Key Entry Screen
+- **Description:** A screen optimized for entering various key types (unlock, cleaning, config) which might be alphanumeric.
+- **Data from `ApplicationLogic_Task`:** (e.g., `KeyEntryScreenData_t { char current_key_buffer[MAX_KEY_LEN+1]; uint8_t cursor_position; AllowedChars_t allowed_chars_type; }`).
+- **Drawing Logic:** To be defined, may involve a custom on-screen keyboard or character selector.
+- **Internal State:** Minimal visual state (e.g., cursor blink).
+- **Responding to Translated Input:** Driven by `ApplicationLogic_Task`.
+- **Theme Application:** To be defined.
+
 ## 4. Animation Engine Implementation
 
 The Animation Engine is solely responsible for executing all visual animations within `Display_Task`, as per `Doccumentation/architecture.txt` (section 4.2.1). This includes both XBM frame-by-frame animations and property tweening animations (e.g., for smooth scrolling, fading, or value changes).
@@ -672,12 +704,16 @@ UI Components or Screen Handlers that need to use an animated property value wil
                 - `end_value = payload->type_specific_payload.tween_params.end_value`.
                 - `current_tween_value = start_value`.
                 - `animation_start_time_ms = GetCurrentTimeMs()`, `last_frame_time_ms = GetCurrentTimeMs()`.
-        - If using per-animation timers, create and start it. (If single timer, it will pick it up).
+        // A single system RTOS timer periodically signals Display_Task.
+        // Display_Task then calls Display_HandleAnimationTick() which iterates through g_active_animations.
+        // No per-animation timers are created or managed by the AnimationEngine itself.
+        // Ensure the RTOS timer is started if it's not already running and there's at least one active animation.
+        // Ensure the RTOS timer is stopped if there are no active animations to save power.
 - **Stopping:**
     - `AnimationEngine_Stop(AnimationID anim_id)`:
         - Find the active animation by `anim_id`.
         - Mark `is_active = false`.
-        - If using per-animation timer, stop and delete it. (Not applicable with single system timer).
+        // The single system RTOS timer continues if other animations are active, or is stopped if this was the last one.
         - Stopping an animation means it will not be drawn in the next rendering pass.
         - If the animation's visual elements need to be explicitly cleared from the screen immediately (rather than waiting for the next natural screen redraw over that area), `ApplicationLogic_Task` should command a screen refresh (e.g., `CMD_DISPLAY_REFRESH`) after stopping the animation.
 - **Modifying:** Less common. Could involve changing speed (adjusting `duration_ms` which implies recalculating progress for tweens or changing frame rate for XBMs) or tween target values. Would require new command types and careful state management within `ActiveAnimation_t`.

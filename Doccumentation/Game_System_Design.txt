@@ -1,1 +1,161 @@
-This document will outline the design of mini-games, including their rules, mechanics, objectives, how they interact with ApplicationLogic_Task to modify lock conditions, their interface with Display_Task for visuals, and configuration options in "Custom Lock" mode. 
+# CKOS Game System Design Document
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document outlines the design of mini-games within the CKOS system. These games are intended to provide user engagement and can optionally modify lock conditions, primarily by affecting lock duration. This document details their rules, mechanics, objectives, interactions with `ApplicationLogic_Task` and `Display_Task`, and configuration options.
+
+### 0.2 Scope
+The scope includes:
+- Core logic for each planned game.
+- Interaction patterns with `ApplicationLogic_Task` for state management and outcome processing.
+- Interface specifications for `Display_Task` for visual representation.
+- Configuration details, especially for "Custom Lock" mode.
+
+This document aligns with `Doccumentation/architecture.txt`, particularly sections concerning `ApplicationLogic_Task`'s role in managing game logic and `Display_Task`'s role in UI rendering.
+
+## 1. General Game System Principles
+
+### 1.1 Game Integration within `ApplicationLogic_Task`
+- All game core logic (state machines, rules, outcome determination) resides within `ApplicationLogic_Task`.
+- Games are typically initiated based on user selection (e.g., in Custom Lock mode or via Agent interaction).
+- `ApplicationLogic_Task` manages the active game state, processes game-related inputs (validated and forwarded by its main event loop), and applies game outcomes to the relevant system parameters (e.g., lock duration).
+
+### 1.2 Game Display via `Display_Task`
+- `ApplicationLogic_Task` sends high-level commands and data to `Display_Task` for rendering the game's visual elements.
+- This includes commands to show specific game screens, update game state information (scores, statuses), and trigger game-specific animations or UI components.
+- `Display_Task` uses its U8g2 library integration and asset management to render the game UI.
+
+### 1.3 Game Configuration
+- Games can be configured when setting up a "Custom Lock."
+- Configuration parameters might include difficulty, reward/penalty scale, or specific game variants.
+- These configurations are stored as part of the `CustomLockConfig_t` structure (see `Doccumentation/Lock_System_Design.txt`).
+
+## 2. Planned Game: Spin the Wheel
+
+### 2.1 Game: Spin the Wheel - Core Logic Implementation (within `ApplicationLogic_Task`)
+
+#### 2.1.1 Overview and Objective
+"Spin the Wheel" is a game of chance. The user initiates a spin, and the wheel lands on a segment determining an outcome, typically a modification to the current lock time (either adding or subtracting time) or other small rewards/penalties.
+
+#### 2.1.2 Game State Machine / Flow Control
+1.  **Idle/ReadyToSpin:** The game is presented, waiting for user input to spin.
+2.  **Spinning:** The wheel animation is active. User input is generally ignored during this phase, or a "stop spin" input might be accepted.
+3.  **SlowingDown:** (Optional sub-state of Spinning) Wheel animation slows, building anticipation.
+4.  **ResultDetermined:** The wheel has stopped, and a segment is selected.
+5.  **ApplyingOutcome:** The outcome of the spin is applied by `ApplicationLogic_Task`.
+6.  **ResultDisplay:** The outcome is displayed to the user. Game may then return to Idle or end.
+
+#### 2.1.3 Rules Engine and Outcome Determination
+-   **Wheel Segments:** The wheel is divided into a predefined number of segments. Each segment has an associated outcome type and value.
+    ```c
+    typedef enum {
+        WHEEL_OUTCOME_TIME_ADD,
+        WHEEL_OUTCOME_TIME_SUBTRACT,
+        WHEEL_OUTCOME_MOOD_BOOST_AGENT, // If agent lock is active
+        WHEEL_OUTCOME_NO_CHANGE,
+        WHEEL_OUTCOME_SMALL_PENALTY_TIME_ADD // A small "zonk"
+    } WheelOutcomeType_t;
+
+    typedef struct {
+        WheelOutcomeType_t type;
+        int32_t value; // For time outcomes: seconds. For mood: mood points.
+        const char* display_text; // Text for the segment, e.g., "+30 Min", "-1 Hour"
+        // Potentially weighting for how often this segment is hit
+        uint8_t probability_weight; // Higher weight = more likely
+    } WheelSegment_t;
+
+    // Example: const WheelSegment_t g_spin_the_wheel_segments[] = { ... };
+    ```
+-   **Spin Logic:**
+    -   When the user initiates a spin, `ApplicationLogic_Task` uses a pseudo-random number generator (PRNG) to determine the outcome.
+    -   The selection can be weighted based on `probability_weight` of each segment.
+    -   The PRNG should be seeded appropriately (e.g., from system uptime, ADC noise) to ensure varied results.
+-   **Outcome Mapping:**
+    -   `WHEEL_OUTCOME_TIME_ADD`: Adds `value` seconds to `LockSession_t.utc_unlock_target_time`.
+    -   `WHEEL_OUTCOME_TIME_SUBTRACT`: Subtracts `value` seconds from `LockSession_t.utc_unlock_target_time`. Ensure time doesn't go below a minimum (e.g., 1 minute or current time).
+    -   `WHEEL_OUTCOME_MOOD_BOOST_AGENT`: If an Agent Lock is active, sends an event to the Agent System to apply a positive mood change.
+    -   `WHEEL_OUTCOME_NO_CHANGE`: No effect on lock time or mood.
+    -   `WHEEL_OUTCOME_SMALL_PENALTY_TIME_ADD`: Adds a small fixed amount of time (e.g., 5-10 minutes).
+
+#### 2.1.4 Processing Validated Game Inputs
+-   **Primary Input:** "Spin" action (e.g., press 'A' button).
+-   `ApplicationLogic_Task` receives this input, transitions the game state to "Spinning."
+-   Optionally, a "Stop Spin" input could be implemented to give a (false) sense of control, but the outcome is typically determined at the start of the spin.
+
+#### 2.1.5 Algorithm for Determining Game Outcomes and Effects
+1.  User triggers "Spin."
+2.  `ApplicationLogic_Task` seeds PRNG if not already done for the session.
+3.  Calculate total probability weight of all segments.
+4.  Generate a random number between 0 and (total_weight - 1).
+5.  Iterate through segments, accumulating weights, until the random number falls within a segment's range. This segment is the "winner."
+6.  Store the `WheelSegment_t` outcome.
+7.  `ApplicationLogic_Task` commands `Display_Task` to start the spinning animation, possibly passing the pre-determined result so the animation can land correctly.
+8.  Once animation completes:
+    -   Apply the effect (modify `utc_unlock_target_time`, notify Agent System, etc.).
+    -   Update `LockSession_t` and persist if necessary.
+    -   Command `Display_Task` to show the result.
+
+#### 2.1.6 Storing/Retrieving Game State
+-   The current state of the "Spin the Wheel" game (e.g., `Idle`, `Spinning`, `ResultDisplay`) is managed transiently within `ApplicationLogic_Task`'s context for the game.
+-   There is no persistent game state to save for "Spin the Wheel" itself, as each spin is a discrete event. The *outcomes* of the game (lock time modifications) are persisted as part of `LockSession_t`.
+
+### 2.2 Game: Spin the Wheel - Display Interaction Implementation
+
+#### 2.2.1 Defining Data Structures Passed to `Display_Task`
+-   **For displaying the wheel and segments:**
+    ```c
+    #define MAX_WHEEL_SEGMENTS 8 // Example
+    typedef struct {
+        const char* segment_display_text; // Text like "+5 MIN"
+        // Color/style ID if segments have visual distinction beyond text
+    } DisplaySegmentData_t;
+
+    typedef struct {
+        uint8_t num_segments;
+        DisplaySegmentData_t segments[MAX_WHEEL_SEGMENTS];
+        uint8_t highlighted_segment_index; // For showing the final result
+        // Potentially theme information
+    } SpinTheWheelScreenData_t;
+    ```
+    `ApplicationLogic_Task` would populate this and send it with `CMD_ACTIVATE_SCREEN` for the game screen.
+-   **For showing the result:**
+    ```c
+    typedef struct {
+        const char* result_text_line1; // e.g., "You won!"
+        const char* result_text_line2; // e.g., "-30 Minutes"
+    } SpinTheWheelResultData_t;
+    ```
+
+#### 2.2.2 Specifying Commands for Game-Specific Animations or UI Elements
+-   **`CMD_GAME_SPIN_THE_WHEEL_START_ANIM { uint8_t target_segment_index, uint16_t duration_ms }`**:
+    -   `ApplicationLogic_Task` sends this to `Display_Task`.
+    -   `target_segment_index`: The pre-determined winning segment index.
+    -   `duration_ms`: How long the animation should roughly take.
+    -   `Display_Task`'s animation engine handles rendering a spinning wheel animation that visually lands on the `target_segment_index`. This might involve a sequence of XBM frames or procedural drawing.
+-   **`CMD_GAME_SPIN_THE_WHEEL_SHOW_RESULT { SpinTheWheelResultData_t result_data }`**:
+    -   After the spin animation and outcome application.
+    -   `Display_Task` shows a screen or overlay with the results.
+-   `Display_Task` needs corresponding screen handlers and animation logic for these commands.
+
+### 2.3 Game: Spin the Wheel - Configuration Implementation
+
+#### 2.3.1 How Game Parameters are Configured in "Custom Lock" Mode
+-   When setting up a "Custom Lock," if "Spin the Wheel" is selected as an optional game, the user might configure:
+    -   **Enable/Disable:** Simply whether the game is part of this lock session.
+    -   **Frequency (Optional):** How often the game can be played (e.g., once per hour, once per day). `ApplicationLogic_Task` would need to track last play time.
+    -   **Segment Set (Optional, Advanced):** Allow users to choose from different "wheel types" (e.g., "Low Risk, Low Reward", "High Risk, High Reward") if multiple `WheelSegment_t` arrays are defined. This would be an enum/ID.
+
+#### 2.3.2 Storage of Configuration
+-   These configuration parameters are stored within `CustomLockConfig_t` (defined in `Doccumentation/Lock_System_Design.txt`).
+    ```c
+    // Example addition to CustomLockConfig_t
+    typedef struct {
+        // ... existing fields ...
+        bool spin_the_wheel_enabled;
+        uint8_t spin_the_wheel_segment_set_id; // ID for which set of WheelSegment_t to use
+        uint32_t spin_the_wheel_play_interval_seconds; // 0 if no limit
+        // uint32_t spin_the_wheel_last_played_utc; // Runtime state, not config
+    } CustomLockConfig_t;
+    ```
+-   `ApplicationLogic_Task` uses these parameters when initiating and managing the "Spin the Wheel" game during a Custom Lock.

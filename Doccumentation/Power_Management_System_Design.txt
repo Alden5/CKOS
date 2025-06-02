@@ -1,1 +1,305 @@
-This document will expand on power management, detailing the state machine for power modes, battery monitoring algorithms, charger IC interaction, the 'insomnia' sleep suppression mechanism, FreeRTOS tickless idle integration, RTC wake-up management, and analysis of peripheral power states. 
+# CKOS Power Management System Design
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document details the system-wide power management strategy for the CKOS firmware. It covers the coordination of power states, power-saving techniques, battery management, and the implementation specifics of related software components. The goal is to maximize battery life while maintaining device responsiveness and reliability.
+
+### 0.2 Scope
+The scope includes:
+- System power state machine implementation.
+- RTOS idle hook (`vPortSuppressTicksAndSleep`) details.
+- Battery management logic.
+- `ckos_power_insomnia_enter/exit` usage and implementation.
+- Tickless idle implementation details.
+- Interactions with `HardwareService_Task` and the BSP for power control.
+
+This document expands upon information found in `Doccumentation/architecture.txt` (Sections 3.0.4, 4.6, 4.6.1, 5.1.5).
+
+## 1. System Power State Machine Implementation
+
+The CKOS system employs a simplified power state machine, primarily managed by `ApplicationLogic_Task` making decisions and `HardwareService_Task` effecting the changes via BSP calls. The actual MCU power modes (RUN, SLEEP, STOP2, STANDBY) are entered by `HardwareService_Task`.
+
+### 1.1. System Power States (Conceptual)
+These are logical states of the system, which map to MCU power modes:
+-   **`SYS_POWER_ACTIVE`**:
+    -   MCU Mode: RUN.
+    -   Description: Device is fully operational, screen may be on, actively processing inputs or performing tasks. Peripherals needed for current operation are active.
+    -   Entry: Default state, on wake-up from any low-power mode if interaction is required.
+-   **`SYS_POWER_IDLE_LIGHT`**:
+    -   MCU Mode: SLEEP (CPU clock stopped, peripherals like timers, RTC, and potentially some communication interfaces remain active).
+    -   Description: Screen may be off or static. System is waiting for external events (button press, RTC alarm, USB connection) or internal timer events. FreeRTOS may put the system here via WFI during short idle periods if `ckos_power_insomnia_level > 0`.
+    -   Entry: Short periods of inactivity, or when `ckos_power_insomnia_level > 0` prevents deeper sleep.
+-   **`SYS_POWER_IDLE_DEEP`**:
+    -   MCU Mode: STOP2.
+    -   Description: Significant power saving. Most peripherals off. RTC active. RAM retention. Wake-up via configured EXTI lines (buttons, door sensors), RTC alarm, USB.
+    -   Entry: Extended periods of inactivity (e.g., display timeout expired, no pending operations), and `ckos_power_insomnia_level == 0`. This is the target state for tickless idle.
+-   **`SYS_POWER_SHUTDOWN_PREP`**: (Transient state)
+    -   MCU Mode: RUN (briefly).
+    -   Description: System is preparing to enter STANDBY or handling a critical battery event. Saving essential state.
+-   **`SYS_POWER_STANDBY`**:
+    -   MCU Mode: STANDBY.
+    -   Description: Lowest power mode. Minimal retention (only backup domain: RTC, specific registers). System context largely lost.
+    -   Entry: Typically due to critically low battery where operation is no longer sustainable, or by explicit user/system command for long-term storage. Wake-up via WKUP pins, RTC, or reset. (Use of STANDBY will be very limited due to context loss).
+
+### 1.2. Logic for Determining Target System Power State
+-   Resides primarily within `ApplicationLogic_Task`, which assesses overall system activity.
+-   **Factors considered:**
+    -   User interaction timers (e.g., display backlight timeout).
+    -   `HardwareService_Task` activity (e.g., HLM active, storage operation in progress - managed by `ckos_power_insomnia_level`).
+    -   `Display_Task` activity (e.g., animation running - `Display_Task` would use `ckos_power_insomnia_enter/exit`).
+    -   Pending RTOS timers or task activity.
+    -   Battery level (from Sensor Management via `HardwareService_Task`).
+-   **Decision Process (Simplified):**
+    1.  If `ckos_power_insomnia_level > 0`, target `SYS_POWER_IDLE_LIGHT` (via WFI in idle hook).
+    2.  Else if active tasks or recent interaction, target `SYS_POWER_ACTIVE` or `SYS_POWER_IDLE_LIGHT`.
+    3.  Else (idle for extended period), target `SYS_POWER_IDLE_DEEP` (STOP2).
+    4.  If battery critical, `ApplicationLogic_Task` may command `HardwareService_Task` to prepare for and enter `SYS_POWER_STANDBY` or a safe shutdown.
+
+### 1.3. Coordination of Peripheral Power States
+-   When `ApplicationLogic_Task` decides on a target system power state (e.g., `SYS_POWER_IDLE_DEEP`), it sends a `REQ_SET_POWER_MODE` message to `HardwareService_Task`.
+-   `HardwareService_Task` is responsible for:
+    -   Calling BSP functions to gate clocks or power down specific peripherals not needed in the target low-power mode *before* entering the MCU low-power state (e.g., `HAL_ADC_Stop()`, `HAL_SPI_DeInit()`). The HAL/LL functions for entering low-power modes (e.g., `HAL_PWREx_EnterSTOP2Mode()`) often handle some of this.
+    -   Ensuring necessary wake-up sources are configured and active for the target mode.
+-   The BSP functions wrap STM32Cube HAL/LL calls (e.g., `__HAL_RCC_SPI1_CLK_DISABLE()`).
+
+## 2. RTOS Idle Hook (`vPortSuppressTicksAndSleep`) Implementation Details
+
+The FreeRTOS idle hook (`vApplicationIdleHook` or `vPortSuppressTicksAndSleep` when tickless idle is enabled) is central to MCU power saving. `architecture.txt` (Section 4.6.1) specifies `vPortSuppressTicksAndSleep` usage.
+
+### 2.1. Location
+-   Typically implemented in `App/Kernel/rtos_hooks.c` or a dedicated power management C file called by the standard hook.
+-   `configUSE_TICKLESS_IDLE` must be set to 1 or 2 in `FreeRTOSConfig.h`.
+
+### 2.2. Logic for Checking `ckos_power_insomnia_level`
+```c
+// Pseudocode for vPortSuppressTicksAndSleep or a function it calls
+// extern volatile uint32_t ckos_power_insomnia_level; // Assume global or accessed via getter
+
+void LowPower_EnterIdle(TickType_t expected_idle_time_ticks) {
+    // Disable interrupts briefly for critical check, or rely on atomic nature of ckos_power_insomnia_level access
+    // uint32_t prev_primask = __get_PRIMASK();
+    // __disable_irq();
+
+    if (ckos_power_insomnia_level > 0) {
+        // __enable_irq(); // Re-enable interrupts if disabled
+
+        // Insomnia active: Only allow light sleep (WFI)
+        // FreeRTOS will handle SysTick suppression if expected_idle_time_ticks is short.
+        // For very short idle times, FreeRTOS might just WFI without suppressing ticks.
+        // If we only WFI, ensure SysTick is not suppressed if FreeRTOS expects it.
+        // This part is subtle and depends on FreeRTOS tickless idle level 1 vs 2.
+        // For simplicity, if insomnia is active, we might just WFI and let FreeRTOS manage ticks.
+        // Or, if we want to ensure no tick suppression for insomnia:
+        // ClearTickInterruptFlag(); // Platform specific
+        // __DSB();
+        // __ISB();
+        // __WFI(); // Wait for Interrupt
+        // No need to call HAL_SuspendTick() or HAL_ResumeTick() explicitly here if FreeRTOS handles it
+        // or if we are not suppressing ticks.
+    } else {
+        // Insomnia inactive: Deep sleep (STOP2) is permitted
+        // __enable_irq(); // Re-enable interrupts if disabled
+
+        // Ensure expected_idle_time_ticks is sufficient for deep sleep
+        // (FreeRTOS usually does this check)
+        if (expected_idle_time_ticks > MIN_IDLE_TICKS_FOR_DEEP_SLEEP) {
+            // 1. Prepare peripherals for STOP2 (BSP calls, may be partly done by HAL_PWREx_EnterSTOP2Mode)
+            BSP_PreSleep_STOP2_Config(); // Example: Disable unnecessary clocks, set GPIOs
+
+            // 2. Suppress SysTick (FreeRTOS port specific, often involves HAL_SuspendTick())
+            // This is typically done by the port layer *before* calling a user-definable pre-sleep processing function.
+            // If vPortSuppressTicksAndSleep is overridden, we might need to do it here.
+            // HAL_SuspendTick(); // If not handled by FreeRTOS port prior to this point
+
+            // 3. Configure RTC for wake-up if expected_idle_time_ticks is not indefinite
+            // FreeRTOS tickless idle level 2 usually handles this by setting up RTC alarm.
+            // If we are overriding it, we need to:
+            // BSP_RTC_SetWakeup(expected_idle_time_ticks);
+
+            // 4. Enter STOP2 mode
+            HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI); // Or WFE if event-based wake
+
+            // 5. After wake-up: Restore system clock, re-enable SysTick, re-init peripherals
+            // SystemClock_Config(); // Often called by HAL on wake from STOP
+            // BSP_PostSleep_STOP2_Config(); // Example: Re-enable clocks/peripherals
+            // HAL_ResumeTick(); // If we suspended it
+
+            // FreeRTOS port layer will adjust RTOS tick count based on time spent asleep.
+        } else {
+            // Idle time too short for deep sleep, just WFI
+            // ClearTickInterruptFlag(); // Platform specific
+            // __DSB();
+            // __ISB();
+            // __WFI();
+        }
+    }
+}
+
+// If using configUSE_IDLE_HOOK_SYSTICK_STOP (custom tickless idle):
+// The actual implementation of vPortSuppressTicksAndSleep (if configUSE_TICKLESS_IDLE = 2)
+// or a similar function called by vApplicationIdleHook will contain this logic.
+// The key is that HAL_SuspendTick() and HAL_ResumeTick() are called around the low-power mode entry.
+// The RTC is configured by FreeRTOS to wake the system at the end of the tickless period.
+```
+The actual implementation is heavily dependent on the FreeRTOS port and `configUSE_TICKLESS_IDLE` level. The `architecture.txt` mentions "FreeRTOS tickless idle (RTC wake source)" and "RTOS idle hook manages sleep modes". `vPortSuppressTicksAndSleep` is the standard way FreeRTOS implements tickless idle level 2.
+
+### 2.3. Selecting Appropriate Low-Power MCU Mode
+-   **If `ckos_power_insomnia_level > 0`**: Light sleep only (CPU `WFI`, peripherals largely on).
+-   **If `ckos_power_insomnia_level == 0`**: STOP2 mode is the target for significant power saving during idle.
+-   STANDBY mode is not typically entered from the idle hook but by explicit command due to context loss.
+
+### 2.4. Calling `HardwareService_Task` or BSP for MCU Mode Entry/Exit
+-   The idle hook itself, or a function it calls (like `LowPower_EnterIdle` above), will use BSP functions to prepare peripherals and then directly call HAL functions like `HAL_PWREx_EnterSTOP2Mode()` or `__WFI()`.
+-   It does not typically send a message to `HardwareService_Task` to enter sleep, as this would introduce latency and complexity (the idle hook *is* the point where the system has decided it's idle).
+-   `HardwareService_Task` is responsible for *commanded* power mode changes (e.g., from `ApplicationLogic_Task` to enter a specific mode for a longer duration, or to initiate shutdown).
+
+### 2.5. Pre-Sleep and Post-Sleep Peripheral Configuration Management
+-   **Pre-Sleep (before STOP2):**
+    -   Disable clocks to unused peripherals (`__HAL_RCC_ периферический_CLK_DISABLE()`).
+    -   Configure GPIO pins to analog state or a low-power state to prevent floating inputs.
+    -   Ensure SPI/I2C peripherals are de-initialized or in a safe state if their clocks will be gated.
+    -   This is partly handled by `HAL_PWREx_EnterSTOP2Mode()` and specific BSP functions.
+-   **Post-Sleep (after waking from STOP2):**
+    -   `SystemClock_Config()` is usually called by the STM32 startup code or HAL upon wake-up from STOP modes to restore system clocks.
+    -   Re-enable clocks to peripherals that were disabled.
+    -   Re-initialize peripherals if their context was lost or settings need restoring (e.g., `MX_SPI1_Init()`, `MX_ADC1_Init()`).
+    -   BSP functions (`BSP_PostSleep_STOP2_Config()`) can encapsulate these actions.
+
+## 3. Battery Management Logic (within `ApplicationLogic_Task` or dedicated module)
+
+`ApplicationLogic_Task` is responsible for high-level battery management decisions based on data from `HardwareService_Task`. (Ref `architecture.txt` 2.3, 4.6).
+
+### 3.1. Interpreting Battery Voltage Readings
+-   `HardwareService_Task` (Sensor Management sub-module) periodically reads the battery voltage via ADC and caches the value (e.g., in mV).
+-   `ApplicationLogic_Task` can request this cached value or receive proactive notifications (`HST_EVT_BATTERY_LOW`, `HST_EVT_BATTERY_CRITICAL`) from `HardwareService_Task`.
+-   The raw ADC value or mV needs to be mapped to State of Charge (SoC %) if desired, but this requires a discharge curve for the specific Li-ion battery, which can be complex. For CKOS, direct voltage thresholds are likely sufficient.
+    -   Example thresholds:
+        -   Full: > 4100 mV
+        -   Good: 3700 - 4100 mV
+        -   Low Warning: < 3700 mV (e.g., 20% in `architecture.txt`)
+        -   Critical Warning: < 3300 mV (e.g., prompt recharge before unlock)
+        -   Deep Sleep Trigger: < 3000 mV (as per `architecture.txt` 4.6)
+
+### 3.2. Algorithm for Triggering Low Battery Warnings and UI Updates
+1.  `ApplicationLogic_Task` receives battery level (e.g., `HST_EVT_BATTERY_LOW` notification or polled value).
+2.  If battery level crosses the "Low Warning" threshold:
+    -   Set an internal flag (e.g., `g_system_flags.is_battery_low = true;`).
+    -   Send a command to `Display_Task` to show a persistent low battery icon or message on the current screen (e.g., `CMD_SHOW_STATUS_ICON { ICON_ID_BATTERY_LOW }`).
+3.  If battery level crosses "Critical Warning" threshold:
+    -   Set `g_system_flags.is_battery_critical = true;`.
+    -   Send command to `Display_Task` for a more prominent warning (e.g., `CMD_SHOW_MODAL_DIALOG { "Battery Critical! Please Recharge." }`).
+
+### 3.3. Logic for Handling Critically Low Battery States
+-   **Preventing Unlock (`architecture.txt` 2.3):**
+    -   If `ApplicationLogic_Task` receives an unlock request (e.g., PIN entry successful) and `g_system_flags.is_battery_critical` is true (or current voltage is below a specific "cannot unlock" threshold like 3200mV):
+        -   Deny the unlock operation.
+        -   Command `Display_Task` to show "Battery too low to unlock. Please recharge."
+-   **Initiating Deep Sleep (`architecture.txt` 4.6):**
+    -   If `HardwareService_Task` detects battery voltage has fallen below a very low threshold (e.g., 3000 mV), it might:
+        1.  Notify `ApplicationLogic_Task` (`HST_EVT_BATTERY_CRITICAL` or a more severe event).
+        2.  `ApplicationLogic_Task` then commands `HardwareService_Task` via `REQ_SET_POWER_MODE { POWER_MODE_STANDBY }` or a specific "emergency shutdown" request.
+        3.  `HardwareService_Task` would then attempt to save critical state (if any possible at this point, e.g., current lock timer state if not already persisted) and enter STOP2 or STANDBY to protect the battery. RTC remains active.
+-   **Recovery (`architecture.txt` 2.3, 4.6):**
+    -   Upon repowering/charging and waking from this deep sleep:
+        -   `ApplicationLogic_Task` loads the persisted lock state.
+        -   Calculates correct remaining lock time using RTC.
+
+### 3.4. Monitoring Charger IC Status and Providing UI Feedback
+-   The charger IC has a status pin connected to an MCU GPIO (via BSP), as per `architecture.txt` 4.6.
+-   This GPIO should be configured as an interrupt input.
+-   The ISR for this pin change notifies `HardwareService_Task` (e.g., `vTaskNotifyGiveFromISR`).
+-   `HardwareService_Task` reads the pin state (via BSP) and determines charging status (e.g., charging, charge complete, fault).
+-   `HardwareService_Task` then notifies `ApplicationLogic_Task` of the charger status change (e.g., `HST_EVT_CHARGER_STATUS_CHARGING`, `HST_EVT_CHARGER_STATUS_COMPLETE`).
+-   `ApplicationLogic_Task` commands `Display_Task` to update UI accordingly (e.g., show charging icon, display "Charge Complete").
+
+## 4. `ckos_power_insomnia_enter/exit` Usage and Implementation
+
+This mechanism prevents the system from entering deep sleep during critical operations. (Ref `architecture.txt`, Section 4.6.1).
+
+### 4.1. Guidelines for Usage by Various Modules
+-   **Who Calls It:** Any module performing an operation that:
+    -   Is time-critical and cannot be interrupted by deep sleep (e.g., precise PWM burst for HLM).
+    -   Involves peripheral communication that would fail if clocks are stopped (e.g., Flash write/erase, active SPI/I2C transaction not designed to survive STOP modes).
+    -   Requires CPU to be active for a short, bounded period for computation that cannot be deferred.
+-   **Primary Users:**
+    -   `HardwareService_Task` (HLM for memory wire, Storage for Flash operations).
+    -   `Display_Task` (potentially during complex, multi-frame animation sequences if they are not designed to be stateful across sleep cycles, or during display controller command sequences).
+    -   Potentially `ApplicationLogic_Task` if it has short, critical computations that cannot be interrupted.
+-   **Pairing:** `ckos_power_insomnia_enter()` MUST always be paired with a corresponding `ckos_power_insomnia_exit()`, even in error paths. Failure to do so will prevent the system from deep sleeping. Use `try/finally` patterns if applicable in higher-level languages; in C, careful error handling is needed.
+
+### 4.2. Atomic Increment/Decrement Implementation
+```c
+// In a shared utility file or kernel_hooks.c
+#include "stm32l4xx_hal.h" // For __disable_irq, __enable_irq or specific atomic instructions if available
+
+volatile uint32_t ckos_power_insomnia_level = 0;
+
+void ckos_power_insomnia_enter(void) {
+    uint32_t primask_state = __get_PRIMASK(); // Save current interrupt state
+    __disable_irq(); // Disable interrupts to ensure atomicity
+
+    ckos_power_insomnia_level++;
+
+    __set_PRIMASK(primask_state); // Restore interrupt state
+}
+
+void ckos_power_insomnia_exit(void) {
+    uint32_t primask_state = __get_PRIMASK();
+    __disable_irq();
+
+    if (ckos_power_insomnia_level > 0) {
+        ckos_power_insomnia_level--;
+    } else {
+        // This case should ideally not happen if enter/exit calls are correctly paired.
+        // Log an error or assert here.
+        // Error_Handler("Insomnia exit called when level was already zero!");
+    }
+
+    __set_PRIMASK(primask_state);
+}
+
+uint32_t ckos_power_get_insomnia_level(void) {
+    // Reading a volatile uint32_t is usually atomic enough for this purpose,
+    // but for strictness, interrupts could be disabled.
+    uint32_t primask_state = __get_PRIMASK();
+    __disable_irq();
+    uint32_t level = ckos_power_insomnia_level;
+    __set_PRIMASK(primask_state);
+    return level;
+}
+```
+-   **Atomicity:** Achieved by disabling interrupts briefly during the increment/decrement. For ARM Cortex-M, `LDREX`/`STREX` instructions could provide true atomic operations if the compiler/library supports them for this, but disabling interrupts is a common and effective method for RTOS primitives.
+
+## 5. Tickless Idle Implementation Details
+
+FreeRTOS Tickless Idle (`configUSE_TICKLESS_IDLE = 2`) allows the system to stop the periodic SysTick interrupt during idle periods, saving power. The RTC is used to wake the system at the time of the next scheduled RTOS task. (Ref `architecture.txt` 3.0.4, 4.6, 5.1.5).
+
+### 5.1. RTC Alarm Setup for Timed Wake-ups
+-   When FreeRTOS determines the system can be idle for `x` ticks, and `ckos_power_insomnia_level == 0`, the port-specific code in `vPortSuppressTicksAndSleep` (or a function it calls) will:
+    1.  Calculate the required wake-up time in RTC counts.
+    2.  Configure one of the RTC alarms (e.g., Alarm A) to trigger at that future time. This involves:
+        -   Disabling the alarm.
+        -   Setting the new alarm time registers.
+        -   Configuring alarm mask (e.g., match seconds, minutes, hours, date as needed).
+        -   Enabling the RTC alarm interrupt in the EXTI controller.
+        -   Enabling the alarm.
+    -   These operations are done via HAL functions (e.g., `HAL_RTC_SetAlarm_IT()`) encapsulated within BSP calls (`BSP_RTC_SetWakeup()`).
+
+### 5.2. SysTick Suppression and Resumption
+-   Before entering STOP2 mode, `HAL_SuspendTick()` is called to disable the SysTick interrupt.
+-   After waking from STOP2 (due to RTC alarm or other interrupt), `HAL_ResumeTick()` is called to re-enable SysTick.
+-   FreeRTOS then calculates the actual time spent asleep (using the RTC) and adjusts its internal tick count accordingly, ensuring task scheduling remains correct.
+
+### 5.3. Considerations for LSE Drift and Accuracy
+-   The Low Speed External oscillator (LSE - typically 32.768 kHz crystal) drives the RTC. Its accuracy is critical for long-term timekeeping and tickless idle precision.
+-   **Drift:** LSE crystals have temperature-dependent frequency drift and aging characteristics. This can cause the RTC to gain or lose time, impacting the accuracy of RTOS task scheduling over long tickless periods.
+-   **Impact:**
+    -   If the RTC runs fast, tasks might wake slightly earlier.
+    -   If the RTC runs slow, tasks might wake slightly later. This can be more problematic if deadlines are missed.
+-   **Mitigation/Considerations:**
+    -   **Crystal Choice:** Use a high-quality LSE crystal with good stability (low ppm) as specified in the MCU datasheet.
+    -   **Calibration:** Some MCUs offer RTC calibration registers that can be adjusted to compensate for LSE drift. This typically requires periodic comparison with a more accurate clock source (not usually available on device). CKOS does not plan for on-device RTC calibration beyond initial factory setup.
+    -   **Tick Re-synchronization:** FreeRTOS inherently re-synchronizes its tick count with the RTC after each wake-up from tickless idle. This corrects for drift *during that specific idle period*. However, the underlying RTC time itself continues to drift.
+    -   **Scheduling Accuracy:** For CKOS, slight drifts in task wake-up times from tickless idle are generally acceptable. Critical timing (like memory wire PWM) is handled with `ckos_power_insomnia_enter/exit` which avoids tickless deep sleep.
+    -   The primary concern is the overall accuracy of the UTC time maintained by the RTC for lock durations, which is a separate issue from tickless idle's impact on short-term task scheduling.

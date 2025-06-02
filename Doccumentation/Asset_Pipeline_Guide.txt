@@ -1,0 +1,202 @@
+# CKOS Asset Pipeline Guide
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document details the complete lifecycle of UI and other assets within the CKOS project, from their source file formats to their integration and usage in the firmware. It serves as a guide for developers working with visual and font assets.
+
+### 0.2 Scope
+The scope includes:
+- Management of image assets (PBM source, XBM C array conversion).
+- Management of font assets (source formats, U8g2 C array conversion).
+- Step-by-step workflow for adding or updating assets.
+- Memory considerations related to assets.
+
+This document aligns with the overall system architecture defined in `Doccumentation/architecture.txt` and the UI system details in `Doccumentation/UI_System_Design.txt`.
+
+### 0.3 Definitions and Acronyms
+- **PBM:** Portable Bitmap (image format)
+- **XBM:** X Bitmap (image format, used as a C array structure)
+- **BDF:** Glyph Bitmap Distribution Format (a common source format for fonts)
+- **U8g2:** Graphics library used for display rendering.
+- **BSP:** Board Support Package
+
+## 1. Image Assets (PBM)
+
+### 1.1 PBM (P1 ASCII Type) Format Specification
+- **Format:** CKOS uses the PBM P1 (ASCII) format for source images.
+    - Header: First line is "P1".
+    - Dimensions: Second line contains width and height in pixels, separated by whitespace (e.g., "64 32" for a 64x32 image).
+    - Data: Subsequent lines contain ASCII '0's (background/white) and '1's (foreground/black), separated by whitespace. Each row of the image starts on a new line.
+- **Constraints:**
+    - **Monochrome:** Images must be strictly 1-bit monochrome.
+    - **Dimensions:** While not strictly limited by the format, consider display resolution (128x64) and available Flash memory. Very large images are impractical.
+    - **Padding:** The `convert_pbm_to_c_array.py` script handles byte alignment for the XBM output, so no specific padding is required in the PBM source itself.
+
+### 1.2 Recommended Tools for Creating and Editing PBM Images
+- **GIMP (GNU Image Manipulation Program):**
+    - Open or create your image.
+    - Convert to Indexed Color mode (Image -> Mode -> Indexed...), select "Use black and white (1-bit) palette".
+    - Export as PBM (File -> Export As...), select "Plain (ASCII)" for "Data formatting" when prompted for PBM options.
+- **ImageMagick:**
+    - Command-line tool for image conversion. Example: `convert my_image.png -monochrome my_image.pbm` (ensure output is ASCII P1).
+- **Online Converters:** Various web-based tools can convert images to PBM. Ensure they output the P1 ASCII variant.
+- **Text Editors:** For very small or simple icons, PBM files can be manually created or edited in a text editor due to their simple ASCII nature.
+
+### 1.3 `convert_pbm_to_c_array.py` Script
+This Python script, located in `Tools/Scripts/`, converts PBM images into XBM-formatted C arrays that can be compiled directly into the firmware.
+
+#### 1.3.1 Detailed Command-Line Options and Usage
+```bash
+python Tools/Scripts/convert_pbm_to_c_array.py <input_pbm_file> <output_c_file_path_and_name> <c_array_variable_name>
+```
+- **`<input_pbm_file>`:** Path to the source PBM image file (e.g., `Assets_Src/Images/agent_happy.pbm`).
+- **`<output_c_file_path_and_name>`:** Path and name for the generated C header file (e.g., `App/Display/Assets/Images/g_xbm_agent_happy.h`). It's recommended to use `.h` extension for direct inclusion.
+- **`<c_array_variable_name>`:** The desired C variable name for the XBM array (e.g., `g_xbm_agent_happy`).
+
+**Example:**
+```bash
+python Tools/Scripts/convert_pbm_to_c_array.py Assets_Src/Images/status_icon.pbm App/Display/Assets/Images/g_xbm_status_icon.h g_xbm_status_icon
+```
+
+#### 1.3.2 Input PBM File Requirements
+- Must be a valid PBM P1 (ASCII) file.
+- Dimensions should be appropriate for the intended UI element and display capabilities.
+- Monochrome (1-bit color depth).
+
+#### 1.3.3 Explanation of the Output XBM C Array Format
+The script generates a C header file containing a `static const unsigned char` array in XBM format.
+- **XBM Format:** XBM stores monochrome bitmap data where each bit represents a pixel. Pixels are packed into bytes, typically with the least significant bit (LSB) of the first byte corresponding to the first pixel. Rows are padded to the nearest byte boundary.
+- **C Array Structure:**
+  ```c
+  // Example output for a 10x2 image:
+  // /* PBM dimensions: 10x2 */
+  // static const unsigned char g_xbm_my_icon[] = {
+  //     0x03, 0x00, // Row 0 (0b00000011, 0b00000000 - last 6 bits of 2nd byte unused)
+  //     0x03, 0x00  // Row 1
+  // };
+  // #define MY_ICON_WIDTH 10
+  // #define MY_ICON_HEIGHT 2
+  ```
+  The script will also include width and height defines for convenience.
+
+#### 1.3.4 Naming Conventions
+- **Source PBM Files:** Use descriptive lowercase names with underscores (e.g., `agent_sad_face.pbm`, `arrow_left.pbm`). Store in `Assets_Src/Images/`.
+- **Generated C Arrays:** Use `g_xbm_` prefix followed by a name derived from the PBM file (e.g., `g_xbm_agent_sad_face`, `g_xbm_arrow_left`).
+- **Generated .h Files:** Name the file after the array it contains for clarity (e.g., `g_xbm_agent_sad_face.h`). Store in `App/Display/Assets/Images/`.
+
+### 1.4 Directory Structure
+- **Source PBMs:** `Assets_Src/Images/`
+    - Example: `Assets_Src/Images/my_new_icon.pbm`
+- **Generated C Arrays (Headers):** `App/Display/Assets/Images/`
+    - Example: `App/Display/Assets/Images/g_xbm_my_new_icon.h`
+
+### 1.5 Integration of Generated C Arrays into Firmware
+1.  Place the generated `.h` file into `App/Display/Assets/Images/`.
+2.  Include this header file where the XBM array is needed (e.g., in a screen handler or UI component file within `Display_Task`).
+    ```c
+    // In a Display_Task related .c file
+    // #include "Display/Assets/Images/g_xbm_my_new_icon.h"
+    ```
+3.  Use the XBM array with U8g2 drawing functions:
+    ```c
+    // u8g2_DrawXBM(&g_u8g2, x, y, MY_NEW_ICON_WIDTH, MY_NEW_ICON_HEIGHT, g_xbm_my_new_icon);
+    ```
+4.  Ensure the build system (e.g., Makefile, STM32CubeIDE project settings) compiles the C files that include these headers and links them correctly. Since they are headers defining `static const` arrays, they are typically included directly.
+
+## 2. Font Assets
+
+### 2.1 Supported Source Font Formats
+- **BDF (Glyph Bitmap Distribution Format):** This is a common, human-readable format for bitmap fonts and is well-supported by various font tools.
+- Other formats might be usable if they can be converted to a U8g2 compatible C array.
+
+### 2.2 Conversion Process to U8g2 C Array Format
+U8g2 provides tools and methods for converting standard font formats into its own C array representation.
+- **U8g2 `bdfconv` or `otf2bdf` + `bdfconv`:**
+    - U8g2's author provides tools like `bdfconv` (often found within the U8g2 library source or related toolchains) to convert BDF files into U8g2's C array font format.
+    - If you have fonts in OpenType Font (OTF) or TrueType Font (TTF) format, you might first need to convert them to BDF using a tool like `otf2bdf`.
+    - **Command Line (Conceptual for `bdfconv`):**
+      ```bash
+      # This is a general idea; actual tool name and options might vary.
+      # bdfconv -v -f 1 -m '32-127' my_font.bdf -o my_u8g2_font.c -n u8g2_font_my_custom_font
+      ```
+      - `-v`: Verbose output.
+      - `-f 1`: Font format (U8g2 typically uses its own internal format).
+      - `-m '32-127'`: Specifies the range of characters to include (e.g., ASCII printable characters).
+      - `my_font.bdf`: Input BDF file.
+      - `-o my_u8g2_font.c`: Output C file.
+      - `-n u8g2_font_my_custom_font`: Name of the font array in the C file.
+- **Online U8g2 Font Converters:** There are web-based tools that allow uploading font files and configuring parameters to generate U8g2 C arrays. (e.g., U8g2 Font Tool by olikraus on his website).
+
+### 2.3 Storing Source Font Files
+- **Location:** `Assets_Src/Fonts/`
+    - Example: `Assets_Src/Fonts/my_custom_font.bdf`
+
+### 2.4 Integrating Generated Font C Arrays into Firmware
+1.  Place the generated C file (or copy the array definition into a `.h` file) into `App/Display/Assets/Fonts/`.
+    - Example: `App/Display/Assets/Fonts/u8g2_my_custom_font.c` or `App/Display/Assets/Fonts/u8g2_my_custom_font.h`
+2.  If it's a `.c` file, ensure it's compiled and linked by the build system. If it's a `.h` file defining the font array, include it where needed.
+    ```c
+    // In Display_Task or a theme definition file
+    // extern const uint8_t u8g2_font_my_custom_font[] U8X8_FONT_SECTION("u8g2_font_my_custom_font"); // If from .c
+    // Or, if defined in a .h file:
+    // #include "Display/Assets/Fonts/u8g2_my_custom_font.h"
+    ```
+3.  Use the font with U8g2:
+    ```c
+    // u8g2_SetFont(&g_u8g2, u8g2_font_my_custom_font);
+    // u8g2_DrawStr(&g_u8g2, x, y, "Hello!");
+    ```
+    U8g2 comes with a wide selection of pre-converted fonts that can be used directly by including their headers (e.g. `#include <u8g2/u8g2.h>`) and calling `u8g2_SetFont` with their predefined names (e.g. `u8g2_font_ncenB08_tr`). Custom fonts are only needed for specific design requirements not met by the built-in U8g2 fonts.
+
+## 3. Workflow for Adding or Updating Assets
+
+### 3.1 Step-by-Step Process
+1.  **Create/Obtain Source Asset:**
+    - **Image:** Create a PBM (P1 ASCII) image using tools like GIMP. Ensure it meets dimensions and monochrome constraints. Save to `Assets_Src/Images/`.
+    - **Font:** Obtain a BDF font or convert another format to BDF. Save to `Assets_Src/Fonts/`.
+2.  **Convert Asset to C Array:**
+    - **Image:** Run `Tools/Scripts/convert_pbm_to_c_array.py` script:
+      ```bash
+      python Tools/Scripts/convert_pbm_to_c_array.py Assets_Src/Images/<name>.pbm App/Display/Assets/Images/g_xbm_<name>.h g_xbm_<name>
+      ```
+    - **Font:** Use `bdfconv` or an equivalent tool to convert the source font to a U8g2 C array. Place the output in `App/Display/Assets/Fonts/`.
+3.  **Integrate into Firmware:**
+    - Include the generated header file (for images) or ensure the C file (for fonts) is part of the build.
+    - Reference the C array (XBM or font) in the `Display_Task` code (e.g., screen handlers, components, theme definitions).
+4.  **Build and Test:**
+    - Rebuild the firmware.
+    - Flash the firmware to the device.
+    - Verify that the new/updated asset appears correctly in the UI.
+
+### 3.2 When and How to Re-run Conversion Scripts
+- Re-run the conversion script(s) **anytime the source asset file is modified.**
+- For images, this means any change to the PBM file requires re-running `convert_pbm_to_c_array.py`.
+- For fonts, any change to the source BDF (or other format requiring conversion) necessitates re-running the font conversion process.
+
+### 3.3 Verifying Asset Integration
+- **Visual Inspection:** The primary method is to run the firmware on the target device and navigate to the UI screens/states where the asset is used.
+- **Build Output:** Check that the build process completes without errors related to missing files or undefined symbols for the assets.
+- **Debugger:** In some cases, you might inspect memory using a debugger to confirm that the asset data is loaded as expected, but this is usually not necessary if the visual inspection passes.
+
+## 4. Memory Considerations for Assets
+
+### 4.1 Impact of Asset Size on Flash Memory Usage
+- **Primary Impact:** All compiled-in assets (XBM C arrays, U8g2 font C arrays) reside in the Flash memory of the STM32L4 microcontroller.
+- **Size Calculation:**
+    - **XBMs:** The size is roughly (width * height) / 8 bytes, plus a small overhead for the C array definition. The `convert_pbm_to_c_array.py` script outputs byte-aligned data.
+    - **Fonts:** Font sizes can vary significantly based on the number of characters (glyph count), character dimensions, and font data format. U8g2 font data is generally compact.
+- **Cumulative Effect:** The total Flash memory consumed by assets can become significant if many large images or multiple extensive fonts are used.
+- **Monitoring:** Regularly check the `.map` file generated by the linker or use STM32CubeIDE's build analyzer to monitor the size of the `.rodata` section (where `const` data like assets is typically stored) and the total Flash memory usage.
+
+### 4.2 Strategies for Optimizing Asset Sizes
+- **Image Optimization:**
+    - **Minimal Dimensions:** Use the smallest possible dimensions for images/icons that still achieve the desired visual clarity.
+    - **Sparsity:** For PBMs, images with more "background" pixels (0s) might result in slightly more compressible XBM data if a future compression scheme were applied, but for raw XBM, it's purely about pixel count.
+    - **Re-use:** Re-use common icons or image elements where possible instead of creating many similar variations.
+- **Font Optimization:**
+    - **Character Set Subsetting:** When converting fonts, include only the character ranges that are actually needed by the application (e.g., ASCII 32-127 for basic English). Avoid including thousands of glyphs if only a few hundred will be used. U8g2's `bdfconv` tool often has options for this (`-m` parameter).
+    - **Choose Compact Fonts:** Select fonts that are inherently designed to be compact if Flash space is critical. Some pixel fonts are very efficient.
+    - **Limit Font Variations:** Avoid using many different font faces or sizes if not strictly necessary, as each adds to Flash usage.
+- **Conditional Compilation:** If certain assets are only used for specific features that can be compiled out, use preprocessor directives (`#ifdef FEATURE_X ... #endif`) to exclude the asset C arrays from the build when the feature is disabled.
+- **Future: External Storage:** For very asset-heavy applications beyond current scope, assets could be stored in an external Flash/SD card, but this adds significant complexity to the BSP and asset loading mechanisms. (Not planned for CKOS currently).

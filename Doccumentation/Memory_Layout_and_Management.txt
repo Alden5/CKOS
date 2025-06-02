@@ -1,1 +1,367 @@
-This document will provide a detailed breakdown of the system's memory (Flash and RAM maps). It will cover allocations for code, constants, static data, RTOS objects, task stacks, memory pools, MPU configuration details, and strategies for memory analysis and optimization. 
+# CKOS Memory Layout and Management
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document provides a detailed breakdown of how Flash and RAM are organized and utilized within the CKOS firmware for the STM32L452CEU6 microcontroller. It covers memory mapping, static and dynamic allocations, Memory Protection Unit (MPU) configuration, and strategies for analyzing and optimizing memory usage.
+
+### 0.2 Scope
+The scope includes:
+-   Flash memory map (bootloader, code, read-only data, EEPROM emulation).
+-   RAM memory map (data, BSS, heap, task stacks, memory pools).
+-   Implementation details of the custom memory pool allocator.
+-   Detailed MPU configuration for task isolation and fault detection.
+-   Techniques for memory analysis and optimization.
+
+This document expands on information presented in `Doccumentation/architecture.txt` (Sections 3.0.5, 3.3, 3.3.4).
+
+## 1. Flash Memory Map
+
+The STM32L452CEU6 has 512KB of Flash memory. Its usage is organized as follows:
+
+### 1.1. Bootloader Region
+-   **Content:** STM32L4 built-in DFU (Device Firmware Update) bootloader. (Ref `architecture.txt`, Appendix "Bootloader Configuration").
+-   **Location:** Resides in a protected area of system memory, typically at the beginning of the Flash address space (e.g., `0x1FFF0000` range, but this is system memory, not user flash. User DFU code might be part of main flash if custom, but architecture says built-in DFU is used). The built-in DFU bootloader is executed based on boot mode pin configuration (nBOOT0/nBOOT1).
+-   **Size:** Fixed by STMicroelectronics. Not part of the user application's 512KB Flash directly, but it's the mechanism for flashing the user application.
+-   **User Application Start:** The user application code (CKOS firmware) starts at address `0x08000000`.
+
+### 1.2. Vector Table
+-   **Content:** Interrupt vector table, containing addresses of exception and interrupt handlers. The first entry is the initial Main Stack Pointer (MSP) value, and the second is the address of the Reset_Handler.
+-   **Location:** Starts at the beginning of the user application Flash memory, i.e., `0x08000000`.
+-   **Size:** Dependent on the number of supported interrupts for the STM32L452CEU6. Typically a few hundred bytes (e.g., for Cortex-M4, around 114 vectors * 4 bytes/vector = 456 bytes, plus initial SP).
+
+### 1.3. `.text` Section (Program Code)
+-   **Content:** Compiled machine code of the firmware (application logic, RTOS, HAL/LL drivers, libraries).
+-   **Location:** Follows the vector table in Flash.
+-   **Typical Size:** Estimated 60-65% of available user Flash (approx. 300-340KB), as per `architecture.txt` Section 3.3.1. This is the largest section.
+-   **Key Contents:** Functions for `ApplicationLogic_Task`, `Display_Task`, `HardwareService_Task`, FreeRTOS kernel, BSP, STM32Cube HAL/LL drivers.
+
+### 1.4. `.rodata` Section (Read-Only Data)
+-   **Content:** Constant data that does not change during program execution.
+    -   String literals (e.g., `const char* message = "Hello";`).
+    -   Constants defined with `const` (e.g., `const uint32_t TIMEOUT = 1000;`).
+    -   Compiled XBM image assets (C arrays, e.g., `static const unsigned char g_xbm_my_image[] = {...};`).
+    -   U8g2 Font assets (C arrays).
+    -   Lookup tables, pre-calculated values.
+-   **Location:** Typically placed after the `.text` section in Flash.
+-   **Typical Size:** Estimated ~10% of Flash (approx. 50KB), as per `architecture.txt` Section 3.3.1, but highly dependent on the number and size of assets.
+
+### 1.5. EEPROM Emulation Area (X-CUBE-EEP)
+-   **Content:** Area of Flash memory dedicated to emulating EEPROM for persistent storage of application settings and state. Managed by the X-CUBE-EEP middleware. (Ref `architecture.txt`, Section 3.3.1).
+    -   Stores: `LockSession_t`, `LockTimeCounters_t`, `AgentRuntimeState_t`.
+-   **Location:** Usually allocated at the end of the available user Flash memory to simplify updates and avoid conflict with application code growth. The specific start address and size are configured in the X-CUBE-EEP middleware and linker script.
+-   **Size:** Configured based on the number of variables and wear-leveling requirements. Typically a few KBs (e.g., 2 pages of 2KB each = 4KB, or more if many variables/versions are stored).
+-   **User Data Preservation:** This area is intended to be preserved during firmware updates if the update mechanism supports it (DFU typically erases sectors it writes to, so a custom bootloader or careful DFU process would be needed for true preservation across full reflashes, unless this area is explicitly excluded from DFU).
+
+### 1.6. Linker Script (`.ld` file) Overview
+-   **File Names:** `STM32L452CEUX_FLASH.ld` (and potentially `STM32L452CEUX_RAM.ld` if RAM sections are defined separately, though often combined). (Ref `architecture.txt`, Section 8.1 implies these filenames).
+-   **Purpose:** Controls how the linker organizes the output sections (`.text`, `.rodata`, `.data`, `.bss`, etc.) from compiled object files into the final firmware image and specifies their memory addresses.
+-   **Key Definitions in `STM32L452CEUX_FLASH.ld`:**
+    -   `MEMORY` command: Defines memory regions (e.g., `FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K`).
+    -   `SECTIONS` command:
+        -   Placement of `.isr_vector` at the start of `FLASH`.
+        -   Placement of `.text` (code) section.
+        -   Placement of `.rodata` (read-only data) section.
+        -   Defines symbols for section start/end addresses (e.g., `_stext`, `_etext`).
+        -   Specifies alignment for sections.
+        -   May define specific locations for EEPROM emulation area if not handled dynamically by the middleware's own configuration.
+-   Understanding the linker script is crucial for advanced memory analysis and custom memory layouts.
+
+## 2. RAM Memory Map
+
+The STM32L452CEU6 has 160KB of SRAM. Its usage is organized as follows:
+
+### 2.1. `.data` Section
+-   **Content:** Statically allocated global and static variables that are initialized with non-zero values at compile time.
+    -   Example: `int global_var = 10;`, `static bool is_feature_enabled = true;`
+-   **Location:** Starts at the beginning of the RAM region (e.g., `0x20000000`).
+-   **Initialization:** The values for this section are copied from Flash to RAM by the startup code (`SystemInit` or `Reset_Handler` sequence) before `main()` is called.
+
+### 2.2. `.bss` Section (Block Started by Symbol)
+-   **Content:** Statically allocated global and static variables that are initialized to zero or are uninitialized.
+    -   Example: `int global_array[100];`, `static MyStruct_t my_static_struct;`
+-   **Location:** Typically placed immediately after the `.data` section in RAM.
+-   **Initialization:** The startup code clears this entire section to zeros before `main()` is called.
+
+### 2.3. Heap Area(s) used by FreeRTOS
+-   **Content:** Dynamically allocated memory used by FreeRTOS for creating RTOS objects (tasks, queues, semaphores, timers) and potentially by application code if `pvPortMalloc()` is used directly.
+-   **Implementation:** CKOS uses `heap_5.c` (as per `architecture.txt` Section 3.3.2), which allows defining multiple, non-contiguous heap regions. However, for simplicity, a single large region is often configured initially.
+    -   The heap region(s) are defined by `configAPPLICATION_ALLOCATED_HEAP` (if set to 1, user provides `ucHeap` array) or by linker script placement if `heap_5.c` is configured to use memory defined by the linker (e.g., between end of `.bss` and start of stacks growing downwards, or a dedicated large static array).
+    -   `configTOTAL_HEAP_SIZE` in `FreeRTOSConfig.h` defines the total size available to FreeRTOS heap management.
+-   **Location:** After `.bss` or in a specifically allocated static array.
+-   **Management:** FreeRTOS heap management functions (`pvPortMalloc`, `vPortFree`).
+
+### 2.4. Task Stacks
+-   **Content:** Each FreeRTOS task requires its own stack for storing local variables, function call frames, and context switching information.
+-   **Specific Locations, Sizes, and Guard Bands:**
+    -   **`HardwareService_Task`:** ~1KB (Ref `architecture.txt` 3.0.2)
+    -   **`ApplicationLogic_Task`:** ~2KB (Ref `architecture.txt` 3.0.2)
+    -   **`Display_Task`:** ~1.5KB (Ref `architecture.txt` 3.0.2)
+    -   **FreeRTOS Timers Task, Idle Task:** Also have their own stacks, configured in `FreeRTOSConfig.h`.
+    -   **Allocation:** Stacks can be allocated statically (passing a buffer to `xTaskCreateStatic()`) or dynamically by FreeRTOS from its heap when `xTaskCreate()` is called. Given the MPU usage for stack guards, static allocation is common for precise region definition.
+    -   **Placement:** If allocated statically, their locations are defined by the developer. If dynamically, they come from the FreeRTOS heap. Stacks typically grow downwards from higher memory addresses.
+    -   **Guard Bands:** MPU regions are configured as non-writable guard bands at the end (lower address) of each task's allocated stack space to detect stack overflows. (Ref `architecture.txt` 3.0.5).
+
+### 2.5. Static Slab Allocation Arenas (e.g., `display_buffer_arena`)
+-   **Purpose:** Fixed-size memory pools for managing variable-sized resources without general-purpose `malloc/free` fragmentation issues. (Ref `architecture.txt` 3.3.2).
+-   **Implementation:** `memory_pool.c/.h` provides the interface (see Section 3 below).
+-   **Arenas:** These are large, statically allocated `uint8_t` arrays.
+    -   Example: `static uint8_t g_display_message_arena[DISPLAY_MSG_POOL_SIZE_BYTES];`
+-   **Exact Addresses, Sizes, Alignment:**
+    -   **Addresses:** Determined by the linker placing the static arrays in RAM (typically in `.bss` if uninitialized or `.data` if initialized for some reason).
+    -   **Sizes:** Defined by macros in a configuration file (e.g., `memory_pools_config.h`).
+    -   **Alignment:** The `memory_pool.c` implementation should ensure that blocks allocated from these arenas are suitably aligned for the data types they will hold (e.g., 4-byte or 8-byte alignment). The arena itself should also be aligned.
+
+### 2.6. Display Framebuffer
+-   **Content:** Buffer used by `Display_Task` (and U8g2 graphics library) to render the display content before sending it to the physical display.
+-   **Location:**
+    -   As per `Doccumentation/UI_System_Design.txt` (Section 1.4.1), U8g2 in full buffer mode internally allocates its framebuffer. If this internal buffer is used directly, it's typically part of the U8g2 library's static data (in `.bss` or `.data`).
+    -   The size for a 128x64 monochrome display is 1024 bytes (128 * 64 / 8).
+-   If a separate framebuffer was managed outside U8g2 (which is not the case here), it would be a static array: `static uint8_t g_display_framebuffer[1024];`.
+
+## 3. Memory Pool (`memory_pool.c/.h`) Implementation Details
+
+(Ref `architecture.txt` Section 3.3.2, 3.3.4 for example usage).
+This system provides a simple fixed-block-size allocator from a statically defined arena.
+
+### 3.1. Internal Data Structures for Pool and Block Management
+```c
+// In memory_pool.h (Conceptual)
+#define MEMORY_POOL_MAX_BLOCKS 32 // Example
+
+typedef struct {
+    uint8_t* arena_start;       // Pointer to the start of the static memory region
+    size_t total_size_bytes;    // Total size of the arena
+    size_t block_size_bytes;    // Size of each individual block in this pool
+    uint8_t num_blocks;         // Total number of blocks in the pool
+    // Bitmap or linked list for tracking free blocks
+    uint32_t free_blocks_bitmap[MEMORY_POOL_MAX_BLOCKS / 32 + 1]; // Example using bitmap
+    uint8_t allocated_count;    // Number of currently allocated blocks
+} MemoryPool_t;
+```
+
+### 3.2. Algorithms for `memory_pool_alloc()` and `memory_pool_free()`
+
+#### 3.2.1. `memory_pool_init(MemoryPool_t* pool, uint8_t* arena, size_t arena_size, size_t block_size)`
+1.  Store `arena`, `arena_size`, `block_size`.
+2.  Calculate `num_blocks = arena_size / block_size`. Ensure `num_blocks` does not exceed `MEMORY_POOL_MAX_BLOCKS`.
+3.  Initialize `free_blocks_bitmap` to all 1s (all blocks free).
+4.  Set `allocated_count = 0`.
+
+#### 3.2.2. `void* memory_pool_alloc(MemoryPool_t* pool)`
+1.  Search `free_blocks_bitmap` for the first free block (first bit set to 1).
+2.  If a free block is found (at index `i`):
+    a.  Mark it as allocated in the bitmap (set bit `i` to 0).
+    b.  Increment `allocated_count`.
+    c.  Calculate the address of the block: `return pool->arena_start + (i * pool->block_size_bytes);`
+3.  If no free block is found:
+    a.  Return `NULL`.
+
+#### 3.2.3. `void memory_pool_free(MemoryPool_t* pool, void* block_ptr)`
+1.  Validate `block_ptr`:
+    a.  Check if it's within the pool's arena range (`pool->arena_start` to `pool->arena_start + pool->total_size_bytes - 1`).
+    b.  Check if it's aligned to `pool->block_size_bytes` relative to `pool->arena_start`.
+    c.  If invalid, log error and return (or assert).
+2.  Calculate the block index `i = ( (uint8_t*)block_ptr - pool->arena_start ) / pool->block_size_bytes;`.
+3.  Check if the block was actually allocated (bit `i` in bitmap is 0). If not, log double-free error and return.
+4.  Mark the block as free in the bitmap (set bit `i` to 1).
+5.  Decrement `allocated_count`.
+
+### 3.3. Alignment Considerations for Allocated Blocks
+-   The `arena_start` pointer itself should be aligned to the maximum required alignment of data types that will be stored in the pool (e.g., 4-byte or 8-byte alignment using `__ALIGNED(4)` attribute on the static arena array).
+-   If `block_size_bytes` is a multiple of this required alignment, then all allocated blocks will also be correctly aligned.
+-   The `memory_pool_alloc` implementation does not add any per-block headers, so the returned pointer is the start of the usable memory.
+
+### 3.4. Statistics Tracking (`memory_pool_get_stats`)
+```c
+// In memory_pool.h
+typedef struct {
+    uint8_t total_blocks;
+    uint8_t allocated_blocks;
+    uint8_t free_blocks;
+    size_t block_size_bytes;
+} MemoryPoolStats_t;
+
+// In memory_pool.c
+void memory_pool_get_stats(MemoryPool_t* pool, MemoryPoolStats_t* stats) {
+    stats->total_blocks = pool->num_blocks;
+    stats->allocated_blocks = pool->allocated_count;
+    stats->free_blocks = pool->num_blocks - pool->allocated_count;
+    stats->block_size_bytes = pool->block_size_bytes;
+}
+```
+-   `ApplicationLogic_Task` can call this periodically or on demand to monitor pool usage and log warnings if `free_blocks` becomes too low. (Ref `architecture.txt` 3.3.4).
+
+## 4. MPU Configuration for Robustness (Detailed Implementation)
+
+The ARM Cortex-M4 MPU is configured to enhance task isolation and protect against common memory faults. (Ref `architecture.txt` 3.0.5). Configuration happens at startup. FreeRTOS MPU port (`portUSING_MPU_WRAPPERS = 1`) assists in managing regions per task.
+
+### 4.1. Configured MPU Regions (Example Setup)
+The STM32L4 typically supports 8 MPU regions.
+
+-   **Region 0: NULL Pointer Protection**
+    -   Base Address: `0x00000000`
+    -   Size: e.g., 32 Bytes or 256 Bytes (smallest effective size might be 32B, depends on MPU granularity).
+    -   Subregion Disable Mask: N/A if smallest size used.
+    -   Access Permissions: Privileged No Access / Unprivileged No Access.
+    -   Execute Never (XN): Enabled.
+    -   Shareable, Cacheable, Bufferable (TEX/S/C/B): Typically Device, Non-Shareable for this region.
+    -   Purpose: Catch NULL pointer dereferences for read, write, or execute.
+
+-   **Region 1: Flash Memory (Code + RO Data)**
+    -   Base Address: `0x08000000`
+    -   Size: 512KB (or adjusted for EEPROM emulation area if that needs different attributes).
+    -   Access Permissions: Privileged Read-Only / Unprivileged Read-Only.
+    -   Execute Never (XN): Disabled (code execution allowed).
+    -   TEX/S/C/B: Normal Memory, Cacheable, Shareable.
+    -   Purpose: Protect firmware code and read-only data from accidental writes. Allow execution.
+
+-   **Region 2: Full RAM (Background Region for Privileged Access)**
+    -   Base Address: `0x20000000`
+    -   Size: 160KB.
+    -   Access Permissions: Privileged Read/Write, Unprivileged No Access (or Read-Only, depending on policy for unprivileged tasks).
+    -   Execute Never (XN): Enabled.
+    -   TEX/S/C/B: Normal Memory, Cacheable, Shareable.
+    -   Purpose: Default access rule for RAM for privileged code (kernel, drivers). Unprivileged tasks will have more specific regions.
+
+-   **Region 3-5: Task Stack Guard Regions (Example for 3 tasks)**
+    -   For each task (`HardwareService_Task`, `ApplicationLogic_Task`, `Display_Task`):
+        -   **Base Address:** Calculated as `task_stack_base_address - MPU_GUARD_REGION_SIZE`.
+        -   **Size:** e.g., 32 Bytes or a size matching MPU granularity. Aligned appropriately.
+        -   Access Permissions: Privileged No Access / Unprivileged No Access.
+        -   Execute Never (XN): Enabled.
+        -   TEX/S/C/B: Normal Memory.
+        -   Purpose: Detect stack overflow for the specific task. This region is configured by FreeRTOS MPU port (`vPortStoreTaskMPUSettings`) when a task is created or switched in, using information from `xTaskCreateStatic` or `xTaskCreate` parameters if using `MPU_WRAPPERS`.
+    -   The actual stack area *above* the guard band will have Read/Write permissions for that task.
+
+-   **Region 6: Peripheral Region**
+    -   Base Address: `0x40000000` (start of APB/AHB peripherals)
+    -   Size: Covers all used peripheral memory space (e.g., up to `0x5FFFFFFF`).
+    -   Access Permissions: Privileged Read/Write, Unprivileged No Access (tasks access peripherals via SVC calls to `HardwareService_Task`).
+    -   Execute Never (XN): Enabled.
+    -   TEX/S/C/B: Device, Non-Shareable, Bufferable.
+    -   Purpose: Control access to hardware peripherals.
+
+-   **Region 7: Task-Specific RAM Region (Example for `ApplicationLogic_Task`)**
+    -   If a task requires its own private RAM area beyond its stack (e.g., for static variables specific to that task's module if not using global static slab allocators), an MPU region can define this.
+    -   Base Address/Size: As needed.
+    -   Access Permissions: Restricted to that task (Privileged R/W for current task, No Access for others).
+    -   Execute Never (XN): Enabled.
+    -   This is also managed by `vPortStoreTaskMPUSettings` if tasks define their own memory regions.
+
+### 4.2. MPU Configuration at Startup and by FreeRTOS MPU Port
+1.  **Early MPU Setup (in `Reset_Handler` or `SystemInit` before RTOS starts):**
+    -   Configure basic regions: NULL pointer protection, Flash (RO/Execute), Full RAM (Privileged RW/XN).
+    -   Enable the MPU and default memory map (`MPU_CTRL_PRIVDEFENA_Msk`).
+2.  **FreeRTOS MPU Port (`portable/GCC/ARM_CM4_MPU/port.c`):**
+    -   When `configSUPPORT_STATIC_ALLOCATION` is 1 and `xTaskCreateStatic()` is used, task stack buffers and MPU settings (including guard bands) are passed.
+    -   `vPortStoreTaskMPUSettings()` is called by the kernel to set up the task-specific MPU regions (stack, stack guard, potentially others) during context switches. This function programs the MPU registers.
+    -   The FreeRTOS MPU port typically defines a default set of regions for privileged kernel execution and then dynamically adjusts a few regions for the currently running unprivileged task.
+
+### 4.3. `MemManage_Handler()` Implementation
+(Ref `architecture.txt` 3.0.5)
+```c
+// In stm32l4xx_it.c or a fault handling C file
+// Ensure this handler is correctly named and defined in startup_stm32l4xxxx.s
+
+// Variables to store fault information (can be viewed in debugger)
+volatile uint32_t g_mmfsr_val;
+volatile uint32_t g_mmfar_val;
+volatile uint32_t g_cfsr_val; // Includes MMFSR, BFSR, UFSR
+volatile uint32_t g_hfsr_val;
+volatile uint32_t g_faulting_lr; // Link Register value at fault
+volatile uint32_t g_faulting_pc; // Program Counter from stack
+
+void MemManage_Handler_C(uint32_t* psp_address) {
+    // psp_address points to the Process Stack Pointer where context was saved
+    // This allows access to stacked PC, LR, etc.
+
+    g_cfsr_val = SCB->CFSR; // Read Configurable Fault Status Register
+    g_mmfsr_val = (SCB->CFSR & SCB_CFSR_MEMFAULTSR_Msk) >> SCB_CFSR_MEMFAULTSR_Pos; // Extract MMFSR byte
+    g_mmfar_val = SCB->MMFAR; // Read Memory Management Fault Address Register
+    g_hfsr_val = SCB->HFSR;   // Read HardFault Status Register
+
+    // Extract PC and LR from the stack frame pushed by hardware
+    // Order: R0, R1, R2, R3, R12, LR, PC, xPSR
+    g_faulting_pc = psp_address[6]; // Stacked PC
+    g_faulting_lr = psp_address[5]; // Stacked LR
+
+    // Log the fault information (e.g., via ITM, or store in RAM buffer if ITM not safe here)
+    // LOG_MPU_FAULT("MMFSR=0x%02X, MMFAR=0x%08X, PC=0x%08X, LR=0x%08X",
+    //               g_mmfsr_val, g_mmfar_val, g_faulting_pc, g_faulting_lr);
+
+    // Recovery Strategies:
+    // 1. Log and Reset: Simplest for critical unrecoverable faults.
+    //    LogErrorToPersistentStorage(...); // If possible
+    //    NVIC_SystemReset();
+    // 2. Terminate Faulting Task (If FreeRTOS MPU port supports it and fault is task-specific)
+    //    This is complex and depends on FreeRTOS MPU port capabilities.
+    // 3. Enter a safe error state:
+    //    Display_ShowErrorScreen(ERR_MPU_FAULT);
+    //    while(1); // Halt
+
+    // For debugging, an infinite loop is useful:
+    // printf("MPU Fault! MMFSR:0x%02lX MMFAR:0x%08lX PC:0x%08lX
+", g_mmfsr_val, g_mmfar_val, g_faulting_pc);
+    while (1) {
+        // Loop here to allow debugger attachment and inspection of registers
+        __NOP();
+    }
+}
+
+// Assembly wrapper in stm32l4xx_it.s or startup_stm32l4xxxx.s
+// This gets the PSP value correctly.
+__attribute__((naked)) void MemManage_Handler(void) {
+    __asm volatile (
+        " TST LR, #4
+"  // Test bit 2 of LR to check if PSP was used
+        " ITE EQ
+"
+        " MRSEQ R0, MSP
+"  // If 0, MSP was used (e.g. fault in handler mode)
+        " MRSNE R0, PSP
+"  // If 1, PSP was used (fault in thread mode)
+        " B MemManage_Handler_C
+"  // Branch to C handler, R0 has stack pointer
+    );
+}
+```
+
+## 5. Analyzing and Optimizing Memory Usage
+
+### 5.1. Techniques Using Linker Map Files (`.map`)
+-   **Purpose:** The `.map` file (e.g., `STM32Keeper.map`) is generated by the linker and shows how memory is allocated.
+-   **Analysis:**
+    -   **Section Sizes:** Look for sizes of `.text` (code), `.data` (initialized data), `.bss` (zero-initialized data), and FreeRTOS heap.
+    -   **Largest Consumers:** Identify largest functions (in `.text`) and largest static variables (in `.data` or `.bss`).
+    -   **Symbol Table:** View addresses and sizes of all global symbols (functions and variables).
+    -   **Unused Sections/Functions:** If "Garbage Collection" is enabled in linker (`--gc-sections`), unused sections might be removed. The map file can help verify this.
+-   **Example `grep` / `awk` commands on map file (Linux/macOS):**
+    -   `grep "\.o" MyProject.map | sort -k1` (Show object file sizes)
+    -   `grep "g_" MyProject.map` (Show global variables)
+
+### 5.2. Using STM32CubeIDE Memory Analysis Tools
+-   **Build Analyzer:** STM32CubeIDE has a Build Analyzer view (Window -> Show View -> Build Analyzer). After a build, it graphically shows memory usage (Flash and RAM) broken down by section, file, and symbol. This is very useful for quick visual analysis.
+-   **Static Stack Analyzer:** The IDE can perform static stack analysis to estimate worst-case stack usage for functions. (Project Properties -> C/C++ Build -> Settings -> Tool Settings -> MCU GCC Assembler -> Enable static stack analysis).
+
+### 5.3. FreeRTOS Stack Usage Monitoring (`uxTaskGetStackHighWaterMark`)
+-   **Function:** `uxTaskGetStackHighWaterMark(TaskHandle_t xTask)` returns the minimum amount of free stack space (in words) for a task since it started. A small value indicates the task is close to overflowing its stack.
+-   **Usage:**
+    -   Periodically call this for each task from a monitoring task or via debugger.
+    -   The FreeRTOS Task List view in STM32CubeIDE debugger automatically displays this.
+    -   Log warnings if high water mark is below a safe threshold.
+
+### 5.4. Compiler Flags for Size Optimization
+-   In STM32CubeIDE project properties (C/C++ Build -> Settings -> Tool Settings -> MCU GCC Compiler):
+    -   **Optimization Level:**
+        -   `-Os` (Optimize for size): This is typically the best option for embedded systems to reduce Flash footprint.
+        -   `-O2` or `-O3` (Optimize for speed): May increase code size.
+    -   **Other Flags:**
+        -   `-ffunction-sections -fdata-sections`: Allows linker to discard unused functions and data when combined with linker flag `--gc-sections`.
+        -   Link Time Optimization (LTO) (`-flto`): Can further reduce code size and improve performance by optimizing across object files, but increases link time.
+
+### 5.5. Data Structure Packing and Alignment Strategies
+-   **Struct Packing:**
+    -   Use `__attribute__((packed))` (GCC) or `#pragma pack(1)` (some compilers) to reduce padding within structs if memory is extremely tight. However, this can lead to unaligned memory accesses, which might be slower or cause faults on some architectures if not handled carefully. Use with caution.
+    -   Reorder struct members: Placing larger members first can sometimes naturally reduce padding without explicit packing.
+-   **Alignment:** Ensure data structures are aligned appropriately for the CPU architecture (ARM Cortex-M4 typically requires 4-byte alignment for `uint32_t`, `float`, pointers). Misaligned access can cause performance penalties or HardFaults. The compiler usually handles this, but be aware with manual pointer casting or packed structures.

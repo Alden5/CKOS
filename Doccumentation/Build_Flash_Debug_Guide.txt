@@ -1,1 +1,354 @@
-This document will be a practical guide for developers, covering development environment setup, the full build process (including scripts), project configurations, firmware flashing procedures, and a comprehensive debugging guide (IDE features, MPU faults, RTOS issues, logging). 
+# CKOS Build, Flash, and Debug Guide
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document serves as a practical "how-to" guide for developers working on the CKOS project. It covers the entire development lifecycle, from setting up the development environment to building the firmware, flashing it onto the target hardware, and effectively debugging the system.
+
+### 0.2 Scope
+The scope includes:
+-   Development environment setup (STM32CubeIDE, tools).
+-   A detailed walkthrough of the build process, including asset and state table generation scripts.
+-   Explanation of project configuration files.
+-   Firmware flashing procedures using DFU mode and STM32CubeProgrammer.
+-   Comprehensive debugging techniques for STM32CubeIDE, FreeRTOS, MPU faults, and logging.
+
+This guide references tools and procedures mentioned in `Doccumentation/architecture.txt`.
+
+## 1. Development Environment Setup
+
+A consistent development environment is key to efficient team collaboration.
+
+### 1.1. STM32CubeIDE
+-   **Primary IDE:** CKOS firmware development is standardized on STM32CubeIDE.
+-   **Installation:**
+    1.  Download the latest version of STM32CubeIDE from the STMicroelectronics website.
+    2.  Follow the installation instructions for your operating system (Windows, macOS, Linux).
+-   **Workspace Configuration:**
+    1.  Create a new workspace or use an existing one.
+    2.  It's recommended to configure STM32CubeIDE to use spaces instead of tabs (typically 4 spaces for indentation) for consistency with the project's coding style. (Window -> Preferences -> General -> Editors -> Text Editors -> "Insert spaces for tabs").
+    3.  Ensure the C/C++ formatter settings align with the project's coding style (see `Doccumentation/Contribution_and_Coding_Standards.txt`). This might involve importing a project-specific style profile if available.
+-   **Recommended Settings:**
+    -   Enable "Build automatically" (Project -> Build Automatically) for immediate feedback on code changes, or build manually as preferred.
+    -   Familiarize yourself with the Build Analyzer for checking memory usage.
+
+### 1.2. Required External Tools
+-   **Python (for scripts):**
+    -   Version: Python 3.6 or newer.
+    -   Purpose: Used for running asset conversion scripts (`convert_pbm_to_c_array.py`) and state table generation scripts (`generate_state_table.py`).
+    -   Installation: Download from python.org or use a system package manager. Ensure Python is added to your system's PATH.
+-   **Version Control Client (Git):**
+    -   Purpose: For interacting with the project's Git repository (cloning, branching, committing, pulling, pushing).
+    -   Installation: Download from git-scm.com or use a system package manager. GUI clients like Sourcetree, GitKraken, or IDE-integrated Git tools are also acceptable.
+-   **STM32CubeProgrammer:**
+    -   Purpose: For flashing the compiled firmware binary onto the target STM32L452CEU6 device, especially via DFU mode.
+    -   Installation: Download from the STMicroelectronics website.
+
+### 1.3. Initial Project Checkout and Import Procedures
+1.  **Clone the Repository:**
+    ```bash
+    git clone <repository_url> CKOS_Firmware
+    cd CKOS_Firmware
+    ```
+    (Replace `<repository_url>` with the actual URL of the Git repository).
+    Follow branching strategy guidelines from `Doccumentation/Contribution_and_Coding_Standards.txt`.
+2.  **Import Project into STM32CubeIDE:**
+    -   File -> Import...
+    -   Select "General" -> "Existing Projects into Workspace".
+    -   Set "Select root directory" to the path where you cloned `CKOS_Firmware`.
+    -   Ensure the CKOS project (identified by its `.project` file, e.g., `STM32Keeper.ioc`'s parent folder) is checked.
+    -   Click "Finish".
+3.  **Toolchain Verification:**
+    -   Right-click on the project in Project Explorer -> Properties.
+    -   Navigate to C/C++ Build -> Tool Chain Editor.
+    -   Ensure the "Current toolchain" is set to "STM32CubeIDE Default".
+    -   Verify compiler, linker, and other build settings are correctly configured as per the project's setup (usually defaults are fine).
+
+## 2. Build Process Walkthrough
+
+This section details the steps from a clean checkout to generating the firmware binary.
+
+### 2.1. Step-by-Step Guide
+1.  **Clean Checkout/Update:** Ensure your local repository is up-to-date with `git pull` (on the appropriate branch, e.g., `develop`).
+2.  **Run Asset Conversion Scripts (if assets changed):**
+    -   Navigate to the `Tools/Scripts/` directory or run from project root.
+    -   See Section 2.2 for details on `convert_pbm_to_c_array.py`.
+3.  **Run State Table Generation Scripts (if state machine definition changed):**
+    -   Navigate to the `Tools/Scripts/` directory or run from project root.
+    -   See Section 2.3 for details on `generate_state_table.py`.
+4.  **Clean Project (Optional but Recommended):**
+    -   In STM32CubeIDE: Project -> Clean... -> Select project and "Clean projects selected below".
+5.  **Build Project:**
+    -   In STM32CubeIDE: Project -> Build Project (or Ctrl+B / Cmd+B).
+    -   Select the desired build configuration:
+        -   **Debug:** Includes debug symbols, less optimization. Preferred for development and debugging.
+        -   **Release:** Higher optimization, no debug symbols (or limited). For final deployment or performance testing.
+    -   Monitor the "Console" view for build progress and any errors or warnings.
+
+### 2.2. Executing Asset Conversion Scripts (`convert_pbm_to_c_array.py`)
+-   **Purpose:** Converts PBM (Portable Bitmap) image files into XBM-formatted C arrays for direct compilation into the firmware. (Ref `Doccumentation/Asset_Pipeline_Guide.txt`).
+-   **Location:** `Tools/Scripts/convert_pbm_to_c_array.py`
+-   **Command Line Usage:**
+    ```bash
+    python Tools/Scripts/convert_pbm_to_c_array.py <input_pbm_file> <output_c_file_path_and_name> <c_array_variable_name>
+    ```
+    -   Example: `python Tools/Scripts/convert_pbm_to_c_array.py Assets_Src/Images/agent_happy.pbm App/Display/Assets/Images/g_xbm_agent_happy.h g_xbm_agent_happy`
+-   **Inputs:**
+    -   Source PBM image file (P1 ASCII format).
+    -   Desired output path and filename for the C header.
+    -   Desired C variable name for the XBM array.
+-   **Expected Outputs:**
+    -   A `.h` file containing the XBM C array definition (e.g., `static const unsigned char g_xbm_agent_happy[] = {...};`) along with width and height defines.
+-   **When to Run:** Run this script whenever a source PBM image in `Assets_Src/Images/` is added or modified.
+
+### 2.3. Executing State Table Generation Scripts (`generate_state_table.py`)
+-   **Purpose:** Autogenerates C code (`state_machine_table.c/.h`) for the state machine from a CSV or JSON definition file. (Ref `Doccumentation/architecture.txt`, Section 6.1.4).
+-   **Location:** `Tools/Scripts/generate_state_table.py` (This script is assumed to exist based on architecture document).
+-   **Command Line Usage (Conceptual):**
+    ```bash
+    python Tools/Scripts/generate_state_table.py <input_csv_or_json_file> <output_c_file_path> <output_h_file_path>
+    ```
+    -   Example: `python Tools/Scripts/generate_state_table.py Config/state_machine_def.csv App/AppLogic/state_machine_table.c App/AppLogic/state_machine_table.h`
+-   **Inputs:**
+    -   A CSV or JSON file defining states, events, guard conditions, action handlers, and next states.
+    -   Output paths for the generated `.c` and `.h` files.
+-   **Expected Outputs:**
+    -   `state_machine_table.c`: Contains the state transition table data structure.
+    -   `state_machine_table.h`: Contains declarations for the table and related enums/prototypes.
+-   **When to Run:** Run this script whenever the state machine definition file (e.g., `Config/state_machine_def.csv`) is modified.
+
+### 2.4. Understanding Build Outputs
+Upon a successful build, STM32CubeIDE generates several files in the build configuration directory (e.g., `Debug/` or `Release/`):
+-   **`.elf` file (e.g., `STM32Keeper.elf`):** Executable and Linkable Format file. Contains the compiled code, data, debug information, and symbol table. This is the primary file used by the debugger.
+-   **`.bin` file (e.g., `STM32Keeper.bin`):** Raw binary firmware image. This is the file typically used for flashing onto the device using STM32CubeProgrammer in DFU mode. It contains only the executable code and initialized data.
+-   **`.map` file (e.g., `STM32Keeper.map`):** Linker map file. Provides detailed information about memory allocation: where code sections (`.text`), data sections (`.data`, `.bss`), and symbols are placed in Flash and RAM. Useful for analyzing memory usage and troubleshooting linker issues.
+-   **`.list` file (Assembly Listing):** Contains a mix of C source code and the corresponding generated assembly instructions. Useful for low-level debugging and understanding compiler optimizations.
+
+## 3. Project Configuration Files (`App/Config/` directory)
+
+The `App/Config/` directory (as per `architecture.txt`, Section 8.1) contains header files (`.h`) that allow developers to configure system parameters, enable/disable features, and define constants without modifying core logic files.
+
+### 3.1. Explanation of Key Configuration Files and Macros
+(This section needs to list actual or plausible config files and their content. Examples below are illustrative.)
+
+-   **`app_config.h` (Example):**
+    -   `#define APP_VERSION_MAJOR 1`
+    -   `#define APP_VERSION_MINOR 0`
+    -   `#define APP_VERSION_PATCH 0`
+    -   `#define ENABLE_FEATURE_GAME_SYSTEM 1` (1 to enable, 0 to disable)
+    -   `#define ENABLE_LOGGING_VERBOSE 0`
+-   **`bsp_config.h` (Example):**
+    -   `#define BSP_BUTTON_DEBOUNCE_MS 20`
+    -   `#define BSP_ADC_SAMPLE_RATE_HZ 100`
+-   **`freertos_config_app.h` (Example, for application-specific FreeRTOS tweaks not in main `FreeRTOSConfig.h`):**
+    -   `#define DEFAULT_TASK_STACK_SIZE_WORDS 256`
+-   **`memory_pools_config.h` (Example, as per `architecture.txt` 3.3.2):**
+    -   `#define DISPLAY_BUFFER_ARENA_SIZE (8 * 1024)`
+    -   `#define MAX_CONCURRENT_DISPLAY_MESSAGES 10`
+-   **`ui_themes_config.h` (Example, as per `architecture.txt` 6.2):**
+    -   `#define DEFAULT_THEME THEME_ID_BASIC`
+    -   Defines for theme colors, fonts, etc.
+
+### 3.2. How to Enable/Disable Features or Change Parameters
+1.  Open the relevant configuration header file in `App/Config/`.
+2.  Locate the macro corresponding to the feature or parameter.
+3.  Modify the macro's value (e.g., change `0` to `1` to enable a feature, or adjust a numerical value).
+4.  Save the file.
+5.  Perform a clean build of the project for the changes to take effect. Conditional compilation (`#if ENABLE_FEATURE_X ... #endif`) in the C code will include/exclude code blocks based on these macros.
+
+## 4. Firmware Flashing Procedures
+
+This section describes how to flash the compiled `.bin` file onto the STM32L452CEU6.
+
+### 4.1. Using STM32CubeProgrammer
+STM32CubeProgrammer is the recommended tool for flashing via DFU.
+
+#### 4.1.1 GUI Interface Steps:
+1.  **Connect Device in DFU Mode:** See Section 4.2 for DFU mode entry.
+2.  **Launch STM32CubeProgrammer.**
+3.  **Select USB Connection:** In the top-right connection panel, select "USB".
+4.  **Connect to Device:** Click the "Connect" button. If the device is in DFU mode, it should be detected. The DFU device details will appear.
+5.  **Navigate to "Erasing & Programming" Tab:** Click the "Open file" icon (folder icon) or the "Erasing & Programming" tab on the left.
+6.  **Browse for `.bin` File:** Click "Browse" and select the firmware binary (e.g., `CKOS_Firmware/Debug/STM32Keeper.bin`).
+7.  **Set Start Address:** Ensure the "Start address" is correct for the STM32L4's user Flash (typically `0x08000000`). This is usually auto-detected.
+8.  **Optional: Erase Flash:** It's good practice to perform a full chip erase before programming, especially if major changes were made. This can be done via the "Full chip erase" button or option.
+9.  **Start Programming:** Click the "Start Programming" button.
+10. **Wait for Completion:** Monitor the progress bar and log messages. A "File download complete" or similar message will appear.
+11. **Disconnect and Reset:** Click "Disconnect". The device might reset automatically, or you may need to power cycle it or press the reset button (if available externally).
+
+#### 4.1.2 Command-Line Interface (CLI) Steps (Example):
+STM32CubeProgrammer CLI (`STM32_Programmer_CLI.exe` on Windows) can be used for automated flashing.
+```bash
+# Example: Erase and program the device connected via USB DFU
+STM32_Programmer_CLI.exe -c port=USB1 -e all -w "path/to/STM32Keeper.bin" 0x08000000 -v
+```
+-   `-c port=USB1`: Connect to the first detected DFU device on USB.
+-   `-e all`: Erase all user Flash memory.
+-   `-w "path/to/STM32Keeper.bin" 0x08000000`: Write the binary file to address `0x08000000`.
+-   `-v`: Verify after programming.
+-   Consult `STM32_Programmer_CLI.exe -help` for all options.
+
+### 4.2. Step-by-Step DFU Mode Entry on Target Hardware
+Device Firmware Update (DFU) mode allows programming the MCU via USB without needing a dedicated debug probe. (Ref `architecture.txt`, Appendix "Bootloader Configuration").
+
+1.  **Physical Access:** The DFU button is internal and requires opening the physical device enclosure.
+2.  **Power Off:** Ensure the device is powered off or disconnect the battery if easily accessible.
+3.  **Locate DFU Button:** Identify the DFU button on the PCB.
+4.  **Press and Hold DFU Button.**
+5.  **Apply Power / Connect USB:** While still holding the DFU button:
+    -   Connect the device to the PC via USB-C cable.
+    -   Or, if battery is disconnected, reconnect it.
+6.  **Release DFU Button:** After a second or two, release the DFU button.
+7.  **Verification:** The PC should detect a "STM32 Bootloader" device or similar in Device Manager (Windows) or via `lsusb` (Linux). STM32CubeProgrammer should now be able to connect to it in DFU mode.
+
+### 4.3. Troubleshooting Common Flashing Issues
+-   **Device Not Detected in DFU Mode:**
+    -   Ensure correct DFU button procedure was followed.
+    -   Try a different USB cable or USB port.
+    -   Check USB driver installation (STM32CubeProgrammer usually installs necessary DFU drivers).
+    -   Ensure battery has some charge if it's the sole power source during DFU.
+-   **Programming Fails:**
+    -   Try a full chip erase before programming.
+    -   Verify the `.bin` file is not corrupted and the start address is correct.
+    -   Ensure target MCU in STM32CubeProgrammer matches STM32L452CEU6.
+    -   Close other applications that might be trying to access the USB device.
+-   **Verification Errors:**
+    -   Could indicate issues with the Flash memory or an unstable USB connection. Try reprogramming.
+
+## 5. Debugging Techniques and Best Practices
+
+Effective debugging is crucial for firmware development.
+
+### 5.1. STM32CubeIDE Debugger
+The IDE provides a powerful debugger (based on GDB) for ST-LINK debug probes.
+
+#### 5.1.1 Debug Configuration:
+1.  Connect ST-LINK debug probe to the target device's SWD port and to the PC.
+2.  In STM32CubeIDE, right-click project -> Debug As -> STM32 MCU C/C++ Application.
+3.  A debug configuration will be created/launched. Review settings in "Debug Configurations...":
+    -   **Debugger Tab:** Ensure "ST-LINK" is selected. Interface is "SWD". Serial Wire Viewer (SWV) should be enabled if using ITM tracing. Set SWV Core Clock matching MCU speed.
+    -   **Startup Tab:** Ensure "Reset and Run" is selected. Set a breakpoint at `main()` to start.
+
+#### 5.1.2 Effective Use of Debugger Features:
+-   **Breakpoints:**
+    -   Set breakpoints by clicking in the gutter next to line numbers.
+    -   Conditional breakpoints: Right-click breakpoint -> Breakpoint Properties -> Condition.
+    -   Hit Count: Break after N hits.
+-   **Watch Expressions:**
+    -   In "Expressions" view, add variables or C expressions to monitor their values.
+    -   Can view global variables, local variables, static variables, register values.
+-   **Call Stack:**
+    -   "Debug" view shows the current call stack, allowing navigation through function call hierarchy.
+-   **Register View:**
+    -   Window -> Show View -> Registers. Inspect CPU core registers and peripheral registers.
+-   **Memory View:**
+    -   Window -> Show View -> Memory. Inspect contents of specific memory addresses.
+-   **Stepping Controls:**
+    -   Step Into (F5): Enter function calls.
+    -   Step Over (F6): Execute function calls without stepping into them.
+    -   Step Return (F7): Execute remaining lines of current function and return to caller.
+    -   Resume (F8): Continue execution until next breakpoint.
+    -   Suspend: Pause execution.
+    -   Terminate (Ctrl+F2): Stop debugging session.
+
+### 5.2. FreeRTOS Awareness Plugin
+STM32CubeIDE includes a FreeRTOS awareness plugin that is invaluable for debugging RTOS applications.
+-   **Access:** When a debug session is active and paused, these views are available under Window -> Show View -> FreeRTOS.
+-   **Key Views:**
+    -   **Task List:** Shows all created tasks, their current state (Running, Ready, Blocked, Suspended), priority, stack usage (current and high water mark `uxTaskGetStackHighWaterMark`), runtime stats.
+    -   **Queue List:** Shows created queues, messages waiting, space available. Can inspect message contents if simple.
+    -   **Semaphore List:** Shows semaphores and their state (taken/available, count).
+    -   **Timer List:** Shows active software timers, periods, expiry times.
+    -   **Heap Usage:** Shows FreeRTOS heap usage statistics (if `configSUPPORT_DYNAMIC_ALLOCATION` is 1).
+-   This helps diagnose common RTOS issues like task starvation, deadlocks, stack overflows, and incorrect queue/semaphore usage.
+
+### 5.3. SWV/ITM Data Console for `printf` Redirection
+Serial Wire Viewer (SWV) Instrumentation Trace Macrocell (ITM) allows `printf`-style debugging without needing a UART. (Ref `architecture.txt`, Section 7.3.3 `LOG()` macro).
+
+#### 5.3.1 Setup:
+1.  **Hardware Connection:** Ensure SWO pin from ST-LINK is connected to target's SWO pin (usually part of SWD connector).
+2.  **STM32CubeIDE Debug Configuration:**
+    -   Debugger Tab: Enable "Serial Wire Viewer (SWV)".
+    -   Set "Core Clock" accurately (e.g., 80 MHz if MCU runs at 80 MHz).
+    -   "SWO Clock" can be auto-detected or set manually (e.g., 2 MHz).
+3.  **Firmware Code:**
+    -   Implement `_write()` syscall or similar to redirect `printf` output to ITM Port 0.
+    ```c
+    // Example _write function (place in syscalls.c or similar)
+    // #include "stm32l4xx_hal.h" // For ITM_SendChar
+    // int _write(int file, char *ptr, int len) {
+    //     for (int i = 0; i < len; i++) {
+    //         ITM_SendChar((uint8_t)*ptr++);
+    //     }
+    //     return len;
+    // }
+    ```
+    -   Ensure ITM is initialized (often done by HAL SystemInit or can be done manually).
+4.  **SWV ITM Data Console Window:**
+    -   Window -> Show View -> SWV -> SWV ITM Data Console.
+    -   Click "Configure Trace" (red circle icon).
+    -   In "ITM Stimulus Ports", enable Port 0.
+    -   Click "Start Trace".
+-   `printf()` statements in the firmware should now appear in this console.
+
+#### 5.3.2 Interpreting Trace Data:
+-   Output is raw text.
+-   Useful for `LOG()` macro outputs, debug messages.
+-   Can also be used for more advanced tracing like data variable watches or event counters if configured.
+
+### 5.4. MPU Fault Debugging
+The Memory Protection Unit (MPU) helps catch memory access violations. (Ref `architecture.txt`, Sections 3.0.5, 3.3.4 for MPU config, 7.3.1 for analysis).
+
+#### 5.4.1 Analyzing Fault Registers:
+-   When an MPU fault occurs, the CPU vectors to `MemManage_Handler()`.
+-   Inside this handler (or a default handler if not user-defined), inspect fault status registers:
+    -   **`CFSR` (Configurable Fault Status Register):** Address `0xE000ED28`.
+        -   `MMFSR` (Memory Management Fault Status Register) is part of `CFSR` (bits 7:0).
+        -   Key `MMFSR` bits:
+            -   `MSTKERR` (Bit 4): Stacking error during exception entry.
+            -   `MUNSTKERR` (Bit 3): Unstacking error during exception return.
+            -   `DACCVIOL` (Bit 1): Data access violation. `MMFAR` holds faulting address.
+            -   `IACCVIOL` (Bit 0): Instruction access violation. `MMFAR` holds faulting address.
+            -   `MMARVALID` (Bit 7 of `MMFSR`): If set, `MMFAR` contains a valid fault address.
+    -   **`MMFAR` (Memory Management Fault Address Register):** Address `0xE000ED34`. Contains the address that caused the data access violation if `MMARVALID` is set.
+    -   **`HFSR` (HardFault Status Register):** Address `0xE000ED2C`. Check `FORCED` bit (Bit 30) to see if MemManage fault escalated to HardFault.
+-   These registers can be viewed in STM32CubeIDE's "Registers" view under "Core Peripherals" -> "SCB" (System Control Block) or "FAULT_REPORTS".
+
+#### 5.4.2 Identifying Causes of Memory Protection Faults:
+-   **Stack Overflow:** `MSTKERR` or `DACCVIOL` where `MMFAR` points near a task's stack limit (into its MPU guard region). Check FreeRTOS Task List view for stack high water mark.
+-   **NULL Pointer Dereference:** `DACCVIOL` or `IACCVIOL` where `MMFAR` is 0 or a small address, if MPU Region 0 is configured for No Access.
+-   **Write to Read-Only Memory:** `DACCVIOL` where `MMFAR` points to Flash (`.text`, `.rodata`) or an MPU region configured as read-only.
+-   **Access to Unprivileged Region from Privileged Mode (or vice-versa if configured):** Check MPU region attributes.
+-   **Execute Never (XN) Violation:** `IACCVIOL` if trying to execute code from a region marked XN (e.g., stack, data memory).
+
+### 5.5. FreeRTOS Debugging Aids
+-   **`configASSERT(condition)`:** (Ref `architecture.txt` 3.0.2) Halts execution if `condition` is false. Essential for catching logical errors and unmet preconditions.
+-   **Stack Overflow Detection (`configCHECK_FOR_STACK_OVERFLOW`):**
+    -   Set to 1 or 2 in `FreeRTOSConfig.h`.
+    -   Method 2 is more robust. Calls `vApplicationStackOverflowHook()` if an overflow is detected.
+    -   Implement `vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)` to log the error or halt.
+-   **`uxTaskGetStackHighWaterMark(TaskHandle_t xTask)`:** Returns minimum free stack space for a task. Call periodically or in debug views to monitor stack usage.
+-   **`vApplicationMallocFailedHook(void)`:** Called if `pvPortMalloc()` fails (FreeRTOS heap exhaustion). Implement to log or handle.
+
+### 5.6. Effective Use of the On-Device `LOG()` Macro
+(Ref `architecture.txt`, Section 7.3.3 `LOG()` macro and severity levels)
+-   **Purpose:** Provides conditional, severity-leveled logging output via SWV/ITM or UART.
+-   **Implementation (Conceptual):**
+    ```c
+    // In a logging utility header, e.g., app_log.h
+    typedef enum { LOG_LEVEL_ERROR, LOG_LEVEL_WARN, LOG_LEVEL_INFO, LOG_LEVEL_DEBUG, LOG_LEVEL_VERBOSE } LogLevel_t;
+    // Configurable current log level (e.g., via app_config.h)
+    // #define CURRENT_LOG_LEVEL LOG_LEVEL_INFO
+
+    // #define LOG(level, format, ...)     //     do {     //         if (level <= CURRENT_LOG_LEVEL) {     //             printf("[%s] " format "
+", LogLevelToString(level), ##__VA_ARGS__);     //         }     //     } while(0)
+    // const char* LogLevelToString(LogLevel_t level); // Helper function
+    ```
+-   **Usage:**
+    -   `LOG(LOG_LEVEL_ERROR, "HLM failed to actuate: error %d", error_code);`
+    -   `LOG(LOG_LEVEL_INFO, "User %s selected option %d", user_name, option_id);`
+    -   `LOG(LOG_LEVEL_DEBUG, "Sensor value: %d mV", voltage);`
+-   **Severity Levels:** Use appropriate levels to control verbosity. Debug/Release builds can have different `CURRENT_LOG_LEVEL`.
+-   **Performance:** Be mindful that excessive logging (especially `printf` to ITM/UART) can impact real-time performance. Use sparingly in time-critical sections for release builds.
+
+This comprehensive guide should equip developers with the necessary knowledge to build, flash, and debug the CKOS firmware effectively.
