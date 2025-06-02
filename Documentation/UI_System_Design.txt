@@ -199,25 +199,153 @@ The `Display_PerformFullUpdate()` function will then orchestrate rendering to th
 ### 1.3 U8g2 Library Integration
 `Display_Task` uses the U8g2 graphics library for all drawing primitives, via BSP driver wrappers, as stated in `Doccumentation/architecture.txt` (section 4.2).
 
-#### 1.3.1 Initialization
-- `Display_Task` will initialize U8g2 during its startup sequence. This involves:
-    - Calling a BSP function (e.g., `bsp_u8g2_init()`) which sets up the U8g2 structure (`u8g2_t`).
-    - The BSP function will configure U8g2 with the appropriate communication callbacks (SPI/I2C via HAL/LL) and pin configurations (`bsp_pins.h`).
-    - U8g2 will be configured for full framebuffer mode (`Doccumentation/architecture.txt` section 4.2).
+#### 1.3.1 ERC12864F7-4 Display with ST7565R Controller
+The u8g2 library includes native support for the ERC12864F7-4 display with ST7565R controller. Based on analysis of the u8g2 source code, the specific configurations available are:
+
+- **`u8x8_d_st7565_erc12864`**: Standard ERC12864 configuration
+- **`u8x8_d_st7565_erc12864_alt`**: Alternative configuration with improved bias and contrast settings
+
+**Display Specifications:**
+- Resolution: 128x64 pixels monochrome
+- Controller: ST7565R (confirmed in u8x8_d_st7565.c)
+- Interface: 4-wire SPI (recommended) or I2C
+- X-offset configuration: default_x_offset = 0, flipmode_x_offset = 4
+- SPI timing: 4MHz clock, SPI mode 0 (active high, rising edge)
+
+#### 1.3.2 Initialization
+`Display_Task` will initialize U8g2 during its startup sequence with the specific ERC12864F7-4 configuration:
+
 ```c
-// Example U8g2 instance, managed by Display_Task, potentially initialized by BSP
+// U8g2 instance for ERC12864F7-4 display, managed by Display_Task
 static u8g2_t g_u8g2;
 
-// In Display_Task_Init_Internal() or similar
-// bsp_u8g2_init(&g_u8g2, U8G2_R0, bsp_u8g2_gpio_and_delay_stm32, bsp_u8g2_byte_hw_spi_stm32);
-// u8g2_InitDisplay(&g_u8g2);
-// u8g2_SetPowerSave(&g_u8g2, 0); // Wake up display
-// u8g2_ClearBuffer(&g_u8g2); // Clear internal U8g2 buffer
-// u8g2_SendBuffer(&g_u8g2);  // Send to physical display (or use partial update later)
-```
-The BSP wrappers (`bsp_u8g2_gpio_and_delay_stm32`, `bsp_u8g2_byte_hw_spi_stm32`) are crucial for abstracting hardware details from U8g2 and `Display_Task`.
+// BSP callback functions (to be implemented in BSP layer)
+uint8_t bsp_u8g2_gpio_and_delay_stm32(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr);
+uint8_t bsp_u8g2_byte_hw_spi_stm32(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr);
 
-#### 1.3.2 BSP Wrapper Usage
+// In Display_Task_Init_Internal()
+void Display_Task_Init_HW(void) {
+    // Initialize U8g2 for ERC12864F7-4 with ST7565R controller
+    // Using full framebuffer mode (_f) for 128x64 display
+    u8g2_Setup_st7565_erc12864_f(&g_u8g2, U8G2_R0, 
+                                 bsp_u8g2_byte_hw_spi_stm32, 
+                                 bsp_u8g2_gpio_and_delay_stm32);
+    
+    // Initialize display hardware
+    u8g2_InitDisplay(&g_u8g2);
+    
+    // Wake up display from power save mode
+    u8g2_SetPowerSave(&g_u8g2, 0);
+    
+    // Clear internal U8g2 framebuffer (1024 bytes for 128x64)
+    u8g2_ClearBuffer(&g_u8g2);
+    
+    // Send initial blank screen to physical display
+    u8g2_SendBuffer(&g_u8g2);
+    
+    // Set default contrast (can be adjusted later via u8g2_SetContrast)
+    u8g2_SetContrast(&g_u8g2, 128); // Mid-range contrast for ERC12864F7-4
+}
+```
+
+**Alternative Configuration Option:**
+If the standard ERC12864 configuration doesn't provide optimal visual quality, the alternative configuration can be used:
+```c
+// Alternative: u8g2_Setup_st7565_erc12864_alt_f() for improved bias/contrast
+// This uses LCD bias 1/9 (vs 1/7) and lower contrast (0x05 vs 0x018)
+```
+
+The BSP wrappers (`bsp_u8g2_gpio_and_delay_stm32`, `bsp_u8g2_byte_hw_spi_stm32`) are crucial for abstracting STM32L4 hardware details from U8g2 and `Display_Task`.
+
+#### 1.3.3 BSP Implementation for ERC12864F7-4
+The BSP layer must implement two key callback functions for the ERC12864F7-4 display:
+
+**GPIO and Delay Callback:**
+```c
+// BSP implementation for GPIO control and delays
+uint8_t bsp_u8g2_gpio_and_delay_stm32(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
+    switch(msg) {
+        case U8X8_MSG_GPIO_AND_DELAY_INIT:
+            // Initialize GPIO pins for CS, Reset, etc. via STM32 HAL
+            // Configure pins defined in bsp_pins.h
+            break;
+            
+        case U8X8_MSG_DELAY_MILLI:
+            HAL_Delay(arg_int);
+            break;
+            
+        case U8X8_MSG_DELAY_10MICRO:
+            // For ERC12864F7-4 timing requirements
+            HAL_Delay(1); // Minimum 10μs delay, use 1ms for simplicity
+            break;
+            
+        case U8X8_MSG_GPIO_CS:
+            // Control Chip Select pin for SPI
+            HAL_GPIO_WritePin(BSP_DISPLAY_CS_PORT, BSP_DISPLAY_CS_PIN, 
+                             arg_int ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            break;
+            
+        case U8X8_MSG_GPIO_RESET:
+            // Control Reset pin for ST7565R
+            HAL_GPIO_WritePin(BSP_DISPLAY_RESET_PORT, BSP_DISPLAY_RESET_PIN, 
+                             arg_int ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            break;
+            
+        default:
+            return 0; // Unknown message
+    }
+    return 1;
+}
+```
+
+**SPI Communication Callback:**
+```c
+// BSP implementation for SPI communication with ERC12864F7-4
+uint8_t bsp_u8g2_byte_hw_spi_stm32(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int, void *arg_ptr) {
+    switch(msg) {
+        case U8X8_MSG_BYTE_INIT:
+            // SPI peripheral already initialized by STM32CubeMX
+            break;
+            
+        case U8X8_MSG_BYTE_SET_DC:
+            // Control Data/Command pin for ST7565R
+            HAL_GPIO_WritePin(BSP_DISPLAY_DC_PORT, BSP_DISPLAY_DC_PIN, 
+                             arg_int ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            break;
+            
+        case U8X8_MSG_BYTE_START_TRANSFER:
+            // Begin SPI transmission (CS already controlled by GPIO callback)
+            break;
+            
+        case U8X8_MSG_BYTE_SEND:
+            // Send data over SPI to ERC12864F7-4
+            HAL_SPI_Transmit(&hspi1, (uint8_t*)arg_ptr, arg_int, HAL_MAX_DELAY);
+            break;
+            
+        case U8X8_MSG_BYTE_END_TRANSFER:
+            // End SPI transmission
+            break;
+            
+        default:
+            return 0; // Unknown message
+    }
+    return 1;
+}
+```
+
+**Pin Definitions (bsp_pins.h):**
+```c
+// ERC12864F7-4 display pin definitions for STM32L4
+#define BSP_DISPLAY_CS_PORT     GPIOA
+#define BSP_DISPLAY_CS_PIN      GPIO_PIN_4
+#define BSP_DISPLAY_RESET_PORT  GPIOA
+#define BSP_DISPLAY_RESET_PIN   GPIO_PIN_3
+#define BSP_DISPLAY_DC_PORT     GPIOA
+#define BSP_DISPLAY_DC_PIN      GPIO_PIN_2
+// SPI pins (MOSI, SCK) configured via STM32CubeMX for SPI1
+```
+
+#### 1.3.4 BSP Wrapper Usage
 All drawing operations will use U8g2 functions (e.g., `u8g2_DrawStr`, `u8g2_DrawBox`, `u8g2_DrawXBM`) invoked on the `g_u8g2` instance. These calls draw to U8g2's internal framebuffer.
 `Doccumentation/architecture.txt` (section 4.2.1) mentions BSP wrappers for U8g2 access. This implies that direct calls to `u8g2_*` functions might be wrapped by BSP functions like `bsp_u8g2_DrawStr(&g_u8g2, ...)`. However, U8g2 itself is a hardware abstraction. The primary role of the BSP here is to provide the low-level `u8x8_display_info_t`, `u8x8_cad_cb`, and `u8x8_gpio_and_delay_cb` callbacks for U8g2 initialization, and to manage the transfer of the U8g2 framebuffer to the actual display hardware.
 
@@ -233,11 +361,21 @@ The BSP's role for U8g2 is:
 As per `Doccumentation/architecture.txt` (section 4.2.1), `Display_Task` manages a full internal display framebuffer. U8g2 itself maintains a framebuffer when operating in full buffer mode.
 
 #### 1.4.1 Structure and Allocation
-- The U8g2 library, when configured for full framebuffer mode (e.g., `U8G2_ST7565_ERC12864_F_4W_HW_SPI` for the specified ST7565R controller), internally allocates memory for its framebuffer. For a 128x64 monochrome display, this is 1024 bytes (128 * 64 / 8).
-- This buffer is typically allocated statically within the U8g2 library structure or as a global/static array passed to U8g2. `Display_Task` doesn't need a separate `static uint8_t display_framebuffer[1024];` as U8g2's internal buffer is directly used.
+- The U8g2 library, when configured for full framebuffer mode using `u8g2_Setup_st7565_erc12864_f()`, internally allocates memory for its framebuffer. For a 128x64 monochrome display, this is exactly 1024 bytes (128 * 64 / 8).
+- The framebuffer memory is allocated by u8g2's `u8g2_m_16_8_f()` function during setup, which returns a static buffer of size 1024 bytes for the ERC12864F7-4 display.
+- `Display_Task` doesn't need a separate `static uint8_t display_framebuffer[1024];` as U8g2's internal buffer is directly used via `u8g2_GetBufferPtr(&g_u8g2)` if direct access is needed.
 - No "previous frame" buffer is required as partial updates are not implemented.
+
+**Memory Layout for ERC12864F7-4:**
 ```c
+// U8g2's internal buffer structure for ST7565 ERC12864F7-4
+// Buffer size: 1024 bytes (16 tiles wide × 8 tiles high × 8 bytes per tile)
+// Tile organization: 128 pixels wide ÷ 8 = 16 tiles horizontally
+//                    64 pixels high ÷ 8 = 8 tiles vertically
+// Each tile represents 8×8 pixels in column-major bit order
+
 // U8g2's internal buffer is used directly. No separate g_previous_framebuffer is needed.
+static uint8_t* framebuffer_ptr = u8g2_GetBufferPtr(&g_u8g2); // 1024 bytes
 ```
 
 #### 1.4.2 Drawing Order and Layering
@@ -731,11 +869,21 @@ void Display_PerformFullUpdate(void) {
     // 1. Ensure the U8g2 buffer is up-to-date (Display_RenderCurrentScreen should have been called if content changed)
     // Display_RenderCurrentScreen(); // This might be called earlier by the command handler.
 
-    // 2. Send the entire U8g2 buffer to the physical display via BSP
-    bsp_display_send_buffer(&g_u8g2);
+    // 2. Send the entire U8g2 buffer to the ERC12864F7-4 display via u8g2
+    u8g2_SendBuffer(&g_u8g2);
+    
+    // Alternative BSP wrapper approach (if additional processing needed):
+    // bsp_display_send_buffer(&g_u8g2);
+}
+
+// BSP wrapper implementation for ERC12864F7-4 (if needed)
+void bsp_display_send_buffer(u8g2_t* u8g2) {
+    // For ERC12864F7-4, u8g2_SendBuffer() handles all ST7565R communication
+    // via the configured SPI callbacks. BSP wrapper mainly for logging/debug.
+    u8g2_SendBuffer(u8g2);
 }
 ```
-The call to `Display_RenderCurrentScreen()` populates the `g_u8g2` buffer. Then `Display_PerformFullUpdate()` sends this buffer.
+The call to `Display_RenderCurrentScreen()` populates the `g_u8g2` buffer. Then `Display_PerformFullUpdate()` sends this buffer to the ERC12864F7-4 display using u8g2's optimized ST7565R communication protocol.
 
 ## 6. Asset Integration (Implementation Details)
 
