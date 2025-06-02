@@ -1,0 +1,261 @@
+# CKOS Unified Build System
+# Compiles the same App/ source code for both STM32 and Simulator targets
+# This ensures identical behavior between platforms
+
+# =============================================================================
+# BUILD CONFIGURATION
+# =============================================================================
+
+# Default target
+TARGET ?= simulator
+
+# Build directories
+BUILD_DIR = build/$(TARGET)
+OBJ_DIR = $(BUILD_DIR)/obj
+BIN_DIR = $(BUILD_DIR)/bin
+
+# Source directories
+APP_DIR = App
+BSP_SIMULATOR_DIR = BSP_Simulator
+
+# Output executable names
+SIMULATOR_BIN = $(BIN_DIR)/ckos_simulator
+STM32_BIN = $(BIN_DIR)/ckos_stm32.elf
+
+# =============================================================================
+# COMPILER CONFIGURATION
+# =============================================================================
+
+# Simulator build (host compiler)
+ifeq ($(TARGET),simulator)
+    CC = gcc
+    CXX = g++
+    CFLAGS = -Wall -Wextra -std=c99 -g -O2 -DSIMULATOR -DBSP_PLATFORM_SIMULATOR
+    CXXFLAGS = -Wall -Wextra -std=c++17 -g -O2 -DSIMULATOR -DBSP_PLATFORM_SIMULATOR
+    LDFLAGS = 
+    
+    # SDL2 configuration
+    SDL2_CONFIG = sdl2-config
+    ifeq ($(shell which $(SDL2_CONFIG) 2>/dev/null),)
+        # Fallback to homebrew paths on macOS
+        SDL2_CFLAGS = -I/opt/homebrew/include/SDL2 -D_THREAD_SAFE
+        SDL2_LIBS = -L/opt/homebrew/lib -lSDL2
+    else
+        SDL2_CFLAGS = $(shell $(SDL2_CONFIG) --cflags)
+        SDL2_LIBS = $(shell $(SDL2_CONFIG) --libs)
+    endif
+    
+    CFLAGS += $(SDL2_CFLAGS)
+    CXXFLAGS += $(SDL2_CFLAGS)
+    LDFLAGS += $(SDL2_LIBS)
+
+# STM32 build (cross compiler)
+else ifeq ($(TARGET),stm32)
+    CC = arm-none-eabi-gcc
+    CXX = arm-none-eabi-g++
+    CFLAGS = -Wall -Wextra -std=c99 -g -O2 -DSTM32L452xx -DBSP_PLATFORM_STM32
+    CXXFLAGS = -Wall -Wextra -std=c++17 -g -O2 -DSTM32L452xx -DBSP_PLATFORM_STM32
+    LDFLAGS = 
+    
+    # STM32-specific flags
+    MCU_FLAGS = -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+    CFLAGS += $(MCU_FLAGS)
+    CXXFLAGS += $(MCU_FLAGS)
+    LDFLAGS += $(MCU_FLAGS)
+    
+    # STM32 includes and linker script
+    CFLAGS += -ICore/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc -IDrivers/CMSIS/Device/ST/STM32L4xx/Include -IDrivers/CMSIS/Include
+    CXXFLAGS += -ICore/Inc -IDrivers/STM32L4xx_HAL_Driver/Inc -IDrivers/CMSIS/Device/ST/STM32L4xx/Include -IDrivers/CMSIS/Include
+    LDFLAGS += -TSTM32L452CEUX_FLASH.ld -Wl,--gc-sections
+    
+else
+    $(error Invalid TARGET: $(TARGET). Use 'simulator' or 'stm32')
+endif
+
+# Common includes
+CFLAGS += -I$(APP_DIR)
+CXXFLAGS += -I$(APP_DIR)
+
+# =============================================================================
+# SOURCE FILES
+# =============================================================================
+
+# Core application sources (platform-independent)
+ifeq ($(TARGET),simulator)
+    APP_SOURCES = \
+        $(APP_DIR)/main_simulator.cpp \
+        $(APP_DIR)/AppLogic/app_logic.c \
+        $(APP_DIR)/Display/display_api.c \
+        $(APP_DIR)/Hardware/hardware_api.c \
+        $(APP_DIR)/Utils/utils.c
+else
+    APP_SOURCES = \
+        $(APP_DIR)/main.cpp \
+        $(APP_DIR)/AppLogic/app_logic.c \
+        $(APP_DIR)/Display/display_api.c \
+        $(APP_DIR)/Hardware/hardware_api.c \
+        $(APP_DIR)/Utils/utils.c
+endif
+
+# BSP sources (platform-specific)
+ifeq ($(TARGET),simulator)
+    BSP_SOURCES = $(BSP_SIMULATOR_DIR)/bsp_simulator_simple.c
+else ifeq ($(TARGET),stm32)
+    BSP_SOURCES = BSP_STM32/bsp_stm32.c
+    # Also need STM32 HAL sources, FreeRTOS, etc.
+    STM32_SOURCES = \
+        Core/Src/main.c \
+        Core/Src/freertos.c \
+        Core/Src/stm32l4xx_hal_msp.c \
+        Core/Src/stm32l4xx_it.c \
+        Core/Src/system_stm32l4xx.c
+    APP_SOURCES += $(STM32_SOURCES)
+endif
+
+# All sources
+ALL_SOURCES = $(APP_SOURCES) $(BSP_SOURCES)
+
+# =============================================================================
+# OBJECT FILES
+# =============================================================================
+
+# Convert sources to object files
+APP_OBJECTS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(patsubst %.cpp,$(OBJ_DIR)/%.o,$(APP_SOURCES)))
+BSP_OBJECTS = $(patsubst %.c,$(OBJ_DIR)/%.o,$(BSP_SOURCES))
+ALL_OBJECTS = $(APP_OBJECTS) $(BSP_OBJECTS)
+
+# =============================================================================
+# BUILD TARGETS
+# =============================================================================
+
+.PHONY: all clean simulator stm32 help
+
+# Default target
+all: $(TARGET)
+
+# Simulator target
+simulator:
+	@echo "Building CKOS for Simulator..."
+	@$(MAKE) TARGET=simulator $(SIMULATOR_BIN)
+
+# STM32 target  
+stm32:
+	@echo "Building CKOS for STM32L452..."
+	@$(MAKE) TARGET=stm32 $(STM32_BIN)
+
+# Create simulator executable
+$(SIMULATOR_BIN): $(ALL_OBJECTS) | $(BIN_DIR)
+	@echo "Linking simulator executable..."
+	$(CXX) $(ALL_OBJECTS) -o $@ $(LDFLAGS)
+	@echo "Simulator build complete: $@"
+
+# Create STM32 executable
+$(STM32_BIN): $(ALL_OBJECTS) | $(BIN_DIR)
+	@echo "Linking STM32 executable..."
+	$(CXX) $(ALL_OBJECTS) -o $@ $(LDFLAGS)
+	@echo "STM32 build complete: $@"
+
+# =============================================================================
+# OBJECT FILE RULES
+# =============================================================================
+
+# C source compilation
+$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
+	@echo "Compiling: $<"
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# C++ source compilation  
+$(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
+	@echo "Compiling: $<"
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# =============================================================================
+# DIRECTORY CREATION
+# =============================================================================
+
+$(OBJ_DIR):
+	@mkdir -p $(OBJ_DIR)
+
+$(BIN_DIR):
+	@mkdir -p $(BIN_DIR)
+
+# =============================================================================
+# UTILITY TARGETS
+# =============================================================================
+
+# Run simulator
+run: simulator
+	@echo "Running CKOS Simulator..."
+	./$(SIMULATOR_BIN)
+
+# Run with debug output
+run-debug: simulator
+	@echo "Running CKOS Simulator with debug output..."
+	DEBUG=1 ./$(SIMULATOR_BIN)
+
+# Flash STM32 (requires STM32CubeProgrammer)
+flash: stm32
+	@echo "Flashing STM32L452..."
+	STM32_Programmer_CLI -c port=SWD -w $(STM32_BIN) 0x08000000 -v -rst
+
+# Clean build artifacts
+clean:
+	@echo "Cleaning build artifacts..."
+	rm -rf build/
+	@echo "Clean complete"
+
+# Show build information
+info:
+	@echo "CKOS Unified Build System"
+	@echo "========================="
+	@echo "TARGET: $(TARGET)"
+	@echo "CC: $(CC)"
+	@echo "CXX: $(CXX)"
+	@echo "CFLAGS: $(CFLAGS)"
+	@echo "CXXFLAGS: $(CXXFLAGS)"
+	@echo "LDFLAGS: $(LDFLAGS)"
+	@echo ""
+	@echo "App Sources: $(words $(APP_SOURCES)) files"
+	@echo "BSP Sources: $(words $(BSP_SOURCES)) files"
+	@echo "Total Sources: $(words $(ALL_SOURCES)) files"
+
+# Help target
+help:
+	@echo "CKOS Unified Build System"
+	@echo "========================="
+	@echo ""
+	@echo "Targets:"
+	@echo "  simulator    Build for host-side simulation (default)"
+	@echo "  stm32        Build for STM32L452 hardware"
+	@echo "  run          Build and run simulator"
+	@echo "  run-debug    Build and run simulator with debug"
+	@echo "  flash        Build and flash STM32 hardware"
+	@echo "  clean        Remove all build artifacts"
+	@echo "  info         Show build configuration"
+	@echo "  help         Show this help message"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make simulator        # Build for simulation"
+	@echo "  make stm32           # Build for STM32"
+	@echo "  make run             # Build and run simulator"
+	@echo "  make TARGET=stm32    # Explicit target selection"
+
+# =============================================================================
+# DEPENDENCY TRACKING
+# =============================================================================
+
+# Include dependency files if they exist
+-include $(ALL_OBJECTS:.o=.d)
+
+# Generate dependency files during compilation
+$(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
+	@echo "Compiling: $<"
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
+	@echo "Compiling: $<"
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
