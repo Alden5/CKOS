@@ -1,0 +1,1 @@
+This directory is intended for the u8g2 library. The library should be downloaded from https://github.com/olikraus/u8g2 and its source files (contents of csrc/ and possibly others) should be placed here.
