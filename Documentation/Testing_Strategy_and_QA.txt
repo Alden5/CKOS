@@ -1,1 +1,294 @@
-This document will expand on the project's testing and quality assurance strategy. It will detail unit testing (Unity, FFF mocking), integration testing, HIL testing plans, static analysis tool usage, code coverage metrics, and test case design principles. 
+# CKOS Testing Strategy and Quality Assurance
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document outlines the testing strategy and Quality Assurance (QA) procedures for the CKOS project. The goal is to ensure the development of robust, reliable, and high-quality firmware through a multi-faceted approach to testing and code analysis.
+
+### 0.2 Scope
+The scope includes:
+-   Unit testing methodologies (Unity framework, FFF for mocking).
+-   Integration testing strategies.
+-   Hardware-in-the-Loop (HIL) testing approaches.
+-   Static analysis integration and policies.
+-   Code coverage requirements and analysis.
+-   Principles for designing effective test cases.
+
+This document complements the development guidelines in `Doccumentation/Contribution_and_Coding_Standards.txt` and build procedures in `Doccumentation/Build_Flash_Debug_Guide.txt`. It expands on the Quality Assurance section of `Doccumentation/architecture.txt`.
+
+## 1. Unit Testing (Unity & FFF)
+
+Unit testing focuses on verifying the correctness of individual C modules or functions in isolation. CKOS utilizes the Unity Test Framework and Fake Function Framework (FFF) for mocking.
+
+### 1.1. Setting up the Test Environment
+-   **Host-Based Testing:** Unit tests are typically compiled and run on the host development machine (PC), not on the target hardware. This allows for faster execution and easier integration with CI systems.
+-   **Test Harness:** A separate test runner application (main function) is created for each module or group of related modules being tested. This runner includes Unity's main, initializes FFF, and calls the test functions.
+-   **Build System Integration:** The build system (e.g., Makefiles, CMake, or custom scripts) must be configured to compile test files, the module under test, mocks, Unity source, and FFF source, then link them into a test executable. STM32CubeIDE's build system might need a separate test configuration or external build scripts for host-based tests.
+-   **Directory Structure (Example):**
+    ```
+    ProjectRoot/
+    ├── App/
+    │   └── MyModule/
+    │       ├── my_module.c
+    │       └── include/my_module.h
+    ├── Tests/
+    │   └── Unit/
+    │       ├── TestMyModule/
+    │       │   ├── test_my_module_runner.c (includes Unity main)
+    │       │   ├── test_my_module.c        (contains test cases for my_module)
+    │       │   └── mocks/                  (FFF mocks for dependencies of my_module)
+    │       └── Common/                     (Common test utilities, Unity source, FFF source)
+    ```
+
+### 1.2. Writing Effective Test Cases using Unity
+-   **Unity Framework:** Provides assertions (`TEST_ASSERT_EQUAL_INT`, `TEST_ASSERT_TRUE`, etc.), test case macros (`TEST_CASE`, `TEST_GROUP`), and test runner generation (`RUN_TEST_GROUP`).
+-   **Test Structure:**
+    ```c
+    #include "unity.h"
+    #include "my_module.h" // Module under test
+    #include "mock_bsp_gpio.h" // Example mock for a BSP dependency
+
+    // Optional: Test group setup/teardown
+    TEST_GROUP(MyModuleTests);
+
+    TEST_SETUP(MyModuleTests) {
+        // Code to run before each test in this group (e.g., reset mocks)
+        FFF_FAKES_LIST(RESET_FAKE); // Reset all FFF fakes
+        MyModule_Init(); // Initialize module under test if stateful
+    }
+
+    TEST_TEAR_DOWN(MyModuleTests) {
+        // Code to run after each test in this group
+    }
+
+    TEST(MyModuleTests, TestMyFunction_ValidInput_ReturnsExpected) {
+        // Arrange: Set up preconditions and mock behavior
+        mock_bsp_gpio_read_pin_fake.return_val = true; // Example: mock BSP_GpioReadPin to return true
+
+        // Act: Call the function under test
+        bool result = MyModule_MyFunctionThatUsesGpio();
+
+        // Assert: Verify the outcome
+        TEST_ASSERT_TRUE(result);
+        TEST_ASSERT_EQUAL_UINT32(1, mock_bsp_gpio_read_pin_fake.call_count); // Verify mock was called
+    }
+
+    // More test cases...
+    ```
+-   **Principles for Test Cases:**
+    -   **Isolate:** Test one logical unit/function per test case.
+    -   **Independent:** Test cases should not depend on each other or the order of execution.
+    -   **Repeatable:** Tests should produce the same results every time they are run.
+    -   **Readable:** Test names and code should clearly indicate what is being tested.
+    -   **Thorough:** Cover normal paths, edge cases, boundary conditions, and error conditions.
+
+### 1.3. Comprehensive Guide to Using FFF (Fake Function Framework)
+FFF is used to create mocks (fakes) for dependencies of the module under test. This allows isolating the module from external code (like BSP functions, other application modules, or RTOS calls).
+
+#### 1.3.1. Creating Fakes:
+-   For each function to be mocked (e.g., `bool BSP_GpioReadPin(uint8_t pin_id);`), create a fake in a mock header file (e.g., `mock_bsp_gpio.h`):
+    ```c
+    #include "fff.h"
+    #include "bsp_pins.h" // For types like uint8_t if used in BSP function
+
+    // Declare the fake function using FFF macro
+    // FAKE_VALUE_FUNC(return_type, function_name, arg1_type, arg2_type, ...);
+    // FAKE_VOID_FUNC(function_name, arg1_type, arg2_type, ...);
+
+    FAKE_VALUE_FUNC(bool, mock_bsp_gpio_read_pin, uint8_t); // Mock for BSP_GpioReadPin
+    FAKE_VOID_FUNC(mock_bsp_pwm_start, uint8_t, uint32_t); // Mock for BSP_PwmStart
+    ```
+-   The actual module under test (`my_module.c`) must be compiled such that its calls to `BSP_GpioReadPin` are redirected to `mock_bsp_gpio_read_pin`. This is typically achieved by:
+    -   Compiling `my_module.c` with a preprocessor define that renames `BSP_GpioReadPin` to `mock_bsp_gpio_read_pin`.
+    -   Or, if the BSP functions are declared `weak`, the linker can replace them with the mock implementations.
+    -   Or, more commonly for unit tests, the module under test includes the mock header instead of the real BSP header, and the test build links against the FFF-generated fake definitions rather than the real BSP object file.
+
+#### 1.3.2. Controlling Fake Behavior in Tests:
+-   **Setting Return Values:**
+    `mock_bsp_gpio_read_pin_fake.return_val = true;` (for the next call)
+    `mock_bsp_gpio_read_pin_fake.return_val_seq = (bool[]){true, false, true};` (sequence of return values)
+    `mock_bsp_gpio_read_pin_fake.return_val_seq_len = 3;`
+-   **Custom Fake Implementation (Callback):**
+    ```c
+    // Custom function to be called by the fake
+    bool custom_gpio_read_logic(uint8_t pin_id) {
+        if (pin_id == MY_EXPECTED_PIN) return true;
+        return false;
+    }
+    mock_bsp_gpio_read_pin_fake.custom_fake = custom_gpio_read_logic;
+    ```
+-   **Verifying Call History and Arguments:**
+    -   `TEST_ASSERT_EQUAL_UINT32(1, mock_bsp_gpio_read_pin_fake.call_count);`
+    -   `TEST_ASSERT_EQUAL_UINT8(EXPECTED_PIN_ID, mock_bsp_gpio_read_pin_fake.arg0_val);` (for first argument of last call)
+    -   `TEST_ASSERT_EQUAL_UINT8(EXPECTED_PIN_ID, mock_bsp_gpio_read_pin_fake.arg0_history[0]);` (for first call's first arg)
+-   **Resetting Fakes:**
+    -   `RESET_FAKE(mock_bsp_gpio_read_pin);` (reset a specific fake)
+    -   `FFF_FAKES_LIST(RESET_FAKE);` (if fakes are declared in a list, resets all) - usually done in `TEST_SETUP`.
+
+#### 1.3.3. Mocking Application Modules:
+-   The same FFF principles apply for mocking functions from other application modules that the module under test depends on.
+
+### 1.4. Organizing Test Files and Test Suites
+-   **One Test File Per Module:** Generally, `test_my_module.c` contains all tests for `my_module.c`.
+-   **Test Groups:** Use `TEST_GROUP("GroupName")` in Unity to logically group related tests within a file.
+-   **Test Runners:** A `test_runner.c` file for each test suite (e.g., per module or group of modules) will list all test groups to be run.
+    ```c
+    // In test_my_module_runner.c
+    #include "unity_fixture.h"
+
+    static void RunAllTests(void) {
+        RUN_TEST_GROUP(MyModuleTests);
+        // RUN_TEST_GROUP(AnotherGroupInSameFile);
+    }
+
+    int main(int argc, const char* argv[]) {
+        return UnityMain(argc, argv, RunAllTests);
+    }
+    ```
+
+### 1.5. Running Unit Tests and Interpreting Results
+-   Compile and run the test executable from the command line or via an IDE task.
+-   Unity will output results to the console:
+    -   `.` for each passing test.
+    -   `F` for failing tests, with file, line number, and failure message.
+    -   A summary: `N Tests Y Failures Z Ignored`.
+-   A non-zero return code from the test executable typically indicates test failures, useful for CI.
+
+## 2. Integration Testing Strategy
+
+Integration testing focuses on verifying the interaction between coupled modules or tasks.
+
+### 2.1. Approaches
+-   **Host-Based Simulation:**
+    -   Create test scenarios where multiple application modules (e.g., `LockSystem`, `AgentSystem`) interact on the host PC.
+    -   Hardware dependencies (BSP, HAL) are mocked using FFF.
+    -   RTOS primitives (queues, semaphores, task creation) can be:
+        -   Mocked if interactions are simple.
+        -   Replaced with host-compatible equivalents (e.g., POSIX threads/queues) for more complex scenarios.
+        -   Tested using a FreeRTOS simulator running on the host.
+-   **Partial Hardware Setups:**
+    -   Test interactions on the actual target hardware but with some components simulated or controlled by test scripts (e.g., via debugger or a test interface).
+    -   More complex to set up but provides higher fidelity.
+
+### 2.2. Defining Integration Test Boundaries and Focus Areas
+-   **Message Passing Integrity:** Verify that tasks correctly send, receive, and process messages via RTOS queues as defined in `Doccumentation/Inter_Task_Communication_ICD.txt`.
+    -   Test correct message formatting, payload handling, and timeout behaviors.
+-   **State Transition Sequences:** Test sequences of operations that involve multiple modules or tasks.
+    -   Example: User configures a lock (`ApplicationLogic_Task`), door is closed (`HardwareService_Task` event), lock becomes active (`ApplicationLogic_Task` state change), time expires (RTC event via `HardwareService_Task`), unlock sequence initiated (`ApplicationLogic_Task` commands `HardwareService_Task`).
+-   **Shared Resource Access:** If any resources are shared (even with protection), test for correct concurrent access patterns.
+-   **Focus Areas:**
+    -   `ApplicationLogic_Task` <-> `HardwareService_Task` interface.
+    -   `ApplicationLogic_Task` <-> `Display_Task` interface.
+    -   Interactions between logical modules within `ApplicationLogic_Task` (e.g., `LockSystem` and `AgentSystem`).
+
+## 3. Hardware-in-the-Loop (HIL) Testing
+
+HIL testing involves running the actual firmware on the target hardware while simulating its external environment and interactions.
+
+### 3.1. HIL Test Environment Setup
+-   **Target Device:** STM32L452CEU6 with CKOS firmware.
+-   **Debug Probe:** ST-LINK for control, monitoring, and potentially injecting data.
+-   **Test Controller PC:** Runs test scripts, interfaces with debug probe, and simulates external inputs.
+-   **IO Simulation:**
+    -   Digital I/O card or microcontroller (e.g., another STM32, Raspberry Pi) to simulate button presses, sensor inputs (door switches).
+    -   Potentially a way to simulate ADC inputs for battery/temperature if needed.
+    -   Interface to control power supply for testing battery management.
+-   **Display Capture (Optional):** Camera pointed at the device display, with OCR or image analysis to verify UI output. This is advanced and might not be feasible initially. Simpler HIL tests might rely on firmware logging or state queries via debugger.
+
+### 3.2. Strategy for Developing Automated Test Scripts
+-   **Scripting Language:** Python is often suitable due to its GDB interface libraries (e.g., `pygdbmi`), serial communication libraries, and general scripting capabilities.
+-   **Test Script Actions:**
+    -   Control device state (reset, run, halt via debugger).
+    -   Set breakpoints, read/write memory variables via debugger.
+    -   Trigger simulated hardware inputs (e.g., command I/O card to "press" a button).
+    -   Monitor firmware output (via SWV/ITM, UART logs, or by reading variables).
+    -   Verify expected outcomes and state changes.
+
+### 3.3. Key End-to-End Scenarios for HIL
+-   Full lock lifecycle: Configure lock -> lock device -> wait for duration (can be accelerated by modifying RTC via debugger) -> auto-unlock -> verify.
+-   User interaction flows: PIN entry, menu navigation, agent interaction sequences.
+-   Power management transitions: Verify entry/exit from STOP2 mode, RTC wake-ups.
+-   Error conditions: Simulate sensor failures, low battery, failed unlock attempts.
+
+## 4. Static Analysis Integration and Policy
+
+Static analysis tools examine code without executing it to find potential bugs, style violations, and adherence to coding standards. (Ref `architecture.txt`, Section 7.3.1).
+
+### 4.1. Configuring and Running Tools
+-   **STM32CubeIDE Tools:**
+    -   **MISRA C/C++ Checker:** Configure project properties -> C/C++ Build -> Settings -> Tool Settings -> MCU GCC C Compiler / MCU GCC C++ Compiler -> MISRA C / MISRA C++.
+        -   Select the specific MISRA C:2012 ruleset or a defined subset.
+    -   **Clang-Tidy:** Integrated via "Coding Style" checks or can be configured.
+-   **Execution:**
+    -   Can be run manually from IDE (e.g., right-click project -> Run C/C++ Code Analysis).
+    -   Ideally integrated into the CI pipeline to run automatically on every commit or PR.
+
+### 4.2. Guidelines for Interpreting Reports and Addressing Violations
+-   Treat static analysis findings seriously.
+-   **Errors:** Must be fixed.
+-   **Warnings:** Review each warning.
+    -   If it indicates a potential bug or improves code clarity, fix it.
+    -   If it's a stylistic issue that violates project standards, fix it.
+    -   If it's a known false positive or an intentional deviation with justification, it may be suppressed *locally* in the code with a comment explaining why (e.g., `// cppcheck-suppress specificWarningID ; Reason for suppression`). Global suppression of warnings should be avoided.
+
+### 4.3. Policy for Handling Warnings/Errors
+-   **Zero Critical Issues Before Merge:** Pull requests must not introduce new critical static analysis errors.
+-   **Warning Review:** All new warnings introduced by a PR must be reviewed and either fixed or explicitly justified for suppression.
+-   The goal is to maintain a clean static analysis report and continuously improve code quality.
+
+### 4.4. CI Integration for Automated Static Analysis
+-   Configure CI server (e.g., Jenkins, GitHub Actions) to:
+    -   Run static analysis tools on each commit/PR.
+    -   Fail the build if new critical errors are introduced.
+    -   Report analysis results (e.g., as build artifacts or comments on the PR).
+
+## 5. Code Coverage
+
+Code coverage measures how much of the codebase is executed by tests. (Ref `architecture.txt`, Section 7.3.1, 7.3.2).
+
+### 5.1. Tools and Procedures for Generating Reports
+-   **STM32CubeIDE Pro:** Has built-in code coverage features (e.g., MC/DC - Modified Condition/Decision Coverage). This typically works with on-target execution using a debug probe.
+-   **Host-Based Unit Tests (gcov/lcov):**
+    1.  Compile unit test executables with coverage flags (e.g., GCC: `-fprofile-arcs -ftest-coverage`).
+    2.  Run the test executables. This generates `.gcda` and `.gcno` files.
+    3.  Use `gcov` to generate human-readable coverage reports (`.gcov` files).
+    4.  Use `lcov` to aggregate `gcov` output and generate HTML reports for easier browsing.
+-   **CI Integration:** Automate coverage report generation and publishing as part of the CI pipeline.
+
+### 5.2. Analyzing Coverage Reports
+-   Identify untested or undertested modules, functions, and code branches.
+-   Focus on improving coverage for critical or complex parts of the codebase.
+-   Coverage reports highlight lines of code executed (green) and not executed (red).
+
+### 5.3. Project Code Coverage Targets
+-   **Initial CI Coverage Targets (as per `architecture.txt` 7.3.2):**
+    -   70% line coverage for core logic modules (e.g., `ApplicationLogic_Task` components, `HardwareService_Task` components).
+    -   50% line coverage overall for the project.
+-   These targets should be gradually increased as the project matures.
+-   **Focus:** Aim for high coverage of decision points, error handling paths, and complex algorithms. 100% coverage is often impractical, but critical sections should be as close as possible.
+
+### 5.4. Strategies for Improvement
+-   Write new tests for uncovered code identified in reports.
+-   Refactor complex functions to make them more testable (e.g., break down large functions, separate pure logic from side effects).
+-   Ensure tests cover both "happy path" and error/edge cases.
+
+## 6. Test Case Design Principles
+
+Effective test cases are crucial for meaningful testing.
+
+### 6.1. Applying Techniques
+-   **Equivalence Partitioning:** Divide input data into equivalence classes. Test one representative value from each class. (e.g., for a function taking 0-100, test -5, 50, 105).
+-   **Boundary Value Analysis (BVA):** Test values at the boundaries of equivalence classes. (e.g., for 0-100, test 0, 100, -1, 101, min_int, max_int).
+-   **Error Guessing:** Use experience and intuition to anticipate common errors or tricky scenarios. (e.g., empty inputs, null pointers, maximum values).
+-   **State Transition Testing:** For state machines, design tests to cover all valid transitions and potentially invalid transitions. Ensure entry/exit actions and conditions are tested.
+-   **Decision Table Testing:** For complex logic with multiple conditions, use a decision table to ensure all combinations are considered.
+
+### 6.2. Designing Tests for State Transitions and Critical Paths
+-   **State Machines:**
+    -   Test each state.
+    -   Test each valid event in each state and the resulting transition/action.
+    -   Test invalid events in each state.
+    -   Test sequences of transitions.
+-   **Critical Paths:** Identify the most important execution paths through the code (e.g., main application flows, error recovery sequences) and ensure they are thoroughly tested.
+
+By implementing this comprehensive testing strategy, the CKOS project aims to achieve a high level of software quality and reliability.

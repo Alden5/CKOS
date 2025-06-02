@@ -1,0 +1,380 @@
+# CKOS Contribution and Coding Standards
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document outlines the rules, guidelines, and best practices for collaborative team development on the CKOS project. Adherence to these standards is crucial for maintaining code quality, consistency, and facilitating effective teamwork.
+
+### 0.2 Scope
+The scope of this document includes:
+- Version control (Git) strategy.
+- A detailed coding style guide.
+- The code review process and checklist.
+- Guidelines for proposing and implementing changes or new features.
+- Static analysis compliance expectations.
+
+### 0.3 Guiding Principles
+- **Clarity:** Code and documentation should be clear and easy to understand.
+- **Consistency:** Uniformity in coding style and practices makes the codebase more predictable and maintainable.
+- **Quality:** Strive for high-quality, robust, and well-tested code.
+- **Collaboration:** Follow processes that enable smooth collaboration and knowledge sharing.
+
+## 1. Version Control (Git) Strategy
+
+### 1.1 Branching Model
+CKOS employs a branching model similar to Gitflow to manage development, releases, and bugfixes:
+
+-   **`main` (or `master`):**
+    -   Represents the most recent stable release.
+    -   Only receives merges from `release/*` branches or hotfix branches.
+    -   Should always be in a buildable and deployable state.
+    -   Tagged with version numbers (e.g., `v1.0.0`, `v1.0.1`).
+
+-   **`develop`:**
+    -   The primary integration branch for ongoing development.
+    -   All `feature/*` branches are merged into `develop` after review.
+    -   Represents the current state of development for the next planned release.
+    -   Should generally be stable, but may contain features not yet ready for release.
+    -   Nightly or CI builds are typically run against `develop`.
+
+-   **`feature/<feature-name>`:**
+    -   Branched from `develop`.
+    -   Used for developing new features or significant changes.
+    -   `<feature-name>` should be descriptive (e.g., `feature/agent-mood-system`, `feature/ui-theme-engine`).
+    -   Pushed to the remote repository regularly.
+    -   Merged back into `develop` via a Pull Request (PR) / Merge Request (MR) after code review and testing.
+    -   Should be relatively short-lived.
+
+-   **`bugfix/<issue-id>` or `bugfix/<short-description>`:**
+    -   Branched from `develop` (for bugs found in `develop`) or `main` (for hotfixes on released versions).
+    -   Used for fixing bugs.
+    -   `<issue-id>` can refer to an issue tracker ID.
+    -   Merged back into `develop` (or `main` for hotfixes) via a PR/MR.
+
+-   **`release/<version-number>`:**
+    -   Branched from `develop` when `develop` is deemed feature-complete for an upcoming release (e.g., `release/v1.1.0`).
+    -   Used for final release preparations: stabilization, bug fixing, documentation updates, version bumping.
+    -   No new features are added to a release branch.
+    -   Once ready, the release branch is merged into `main` (and tagged) and also back into `develop` (to ensure `develop` receives any fixes made during the release process).
+
+-   **`hotfix/<version-number>` or `hotfix/<fix-description>`:**
+    -   Branched from `main` to address critical bugs in a production release.
+    -   Merged back into both `main` (and tagged with an incremented patch version) and `develop` (or the current `release/*` branch if one exists) to ensure the fix is incorporated into ongoing development.
+
+### 1.2 Commit Message Conventions
+CKOS adheres to the **Conventional Commits** standard. This provides a structured format for commit messages, making them more readable and enabling automated changelog generation and semantic versioning.
+
+**Format:**
+```
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+-   **`<type>`:** Must be one of the following:
+    -   `feat`: A new feature.
+    -   `fix`: A bug fix.
+    -   `docs`: Documentation only changes.
+    -   `style`: Changes that do not affect the meaning of the code (white-space, formatting, missing semi-colons, etc).
+    -   `refactor`: A code change that neither fixes a bug nor adds a feature.
+    -   `perf`: A code change that improves performance.
+    -   `test`: Adding missing tests or correcting existing tests.
+    -   `build`: Changes that affect the build system or external dependencies (example scopes: gulp, broccoli, npm).
+    -   `ci`: Changes to our CI configuration files and scripts (example scopes: Travis, Circle, BrowserStack, SauceLabs).
+    -   `chore`: Other changes that don't modify src or test files (e.g., updating dependencies, project configuration).
+    -   `revert`: Reverts a previous commit.
+
+-   **`[optional scope]`:** A noun describing the section of the codebase affected by the change (e.g., `ui`, `lock_system`, `bsp`, `docs_ui`). Enclosed in parentheses.
+
+-   **`<description>`:** A concise summary of the change in the present tense. Not capitalized, no period at the end. Max 50-72 characters.
+
+-   **`[optional body]`:** A more detailed explanation of the change. Use imperative mood (e.g., "Fix bug" not "Fixed bug"). Explain the "why" and "how" vs. the "what". Can include multiple paragraphs.
+
+-   **`[optional footer(s)]`:**
+    -   **Breaking Changes:** Start with `BREAKING CHANGE:` followed by a description of the breaking change.
+    -   **Issue Tracking:** Reference related issues (e.g., `Closes #123`, `Fixes #456`).
+
+**Example Commit Message:**
+```
+feat(agent_system): add mood tracking for beginner agent
+
+Introduces a new mood variable for the beginner agent. The mood is
+affected by user interactions during lock setup. This lays groundwork
+for dynamic dialog selection.
+
+Closes #78
+```
+
+**Example Commit Message with Breaking Change:**
+```
+refactor(bsp_api): rename bsp_get_temperature to bsp_read_mcu_temp_celsius
+
+The previous function name was ambiguous. This change provides a clearer
+API for temperature reading.
+
+BREAKING CHANGE: The function `bsp_get_temperature()` has been renamed to
+`bsp_read_mcu_temp_celsius()`. All callers must be updated.
+```
+
+### 1.3 Pull Request (PR) / Merge Request (MR) Process
+1.  **Create Feature/Bugfix Branch:** Branch from `develop` (or `main` for hotfixes).
+2.  **Implement Changes:** Make commits following the conventions. Push changes regularly to the remote.
+3.  **Ensure Quality:**
+    -   Code builds successfully.
+    -   Static analysis checks pass (see Section 5).
+    -   Unit tests are added/updated and pass.
+    -   Code coverage meets project targets (see `Testing_Strategy_and_QA.txt`).
+    -   Manually test the changes on hardware where applicable.
+4.  **Create PR/MR:**
+    -   Target `develop` (or `main` for hotfixes/releases).
+    -   Write a clear title and description for the PR/MR, summarizing the changes and linking to any relevant issues.
+    -   Ensure the PR/MR is as small and focused as possible. Large PRs are harder to review.
+5.  **Code Review:**
+    -   At least one other developer must review the PR/MR (see Section 3).
+    -   Address any feedback or comments from the reviewer(s). Push updates to the same branch.
+6.  **Merge:**
+    -   Once approved and CI checks pass, the PR/MR can be merged.
+    -   Prefer using "squash and merge" or "rebase and merge" to maintain a clean commit history on `develop` and `main`, unless individual commits within the PR are highly significant. The squashed commit message should follow Conventional Commits.
+    -   Delete the feature/bugfix branch after merging.
+
+## 2. Detailed Coding Style Guide
+
+Consistency in coding style is paramount for readability and maintainability. CKOS C code follows these guidelines, largely based on common embedded C practices.
+
+### 2.1 Naming Conventions
+-   **Types (structs, enums, typedefs):** `UpperCamelCase`
+    -   Example: `typedef struct { ... } MyDataStruct_t;`, `typedef enum { STATE_IDLE, ... } SystemState_e;`
+    -   Suffix `_t` for typedefs (structs, simple types).
+    -   Suffix `_e` for enums.
+-   **Functions:** `snake_case_with_module_prefix` (if public) or `static_snake_case` (if static/private)
+    -   Public functions exposed in a module's header should be prefixed with the module name to avoid namespace collisions.
+    -   Example: `Display_Task_RenderScreen()`, `Agent_System_GetMood()`, `HwService_ActuateLock()`
+    -   Static functions (local to a `.c` file): `static void calculate_crc_internal(void);`
+-   **Variables:** `snake_case`
+    -   Example: `uint8_t remaining_attempts;`, `static char* current_user_name;`
+    -   Global variables (avoid if possible): `g_system_tick_count;`
+-   **Macros and Defines:** `UPPER_SNAKE_CASE`
+    -   Example: `#define MAX_BUFFER_SIZE 1024`, `#define IS_VALID_POINTER(p) ((p) != NULL)`
+-   **Enum Members:** `UPPER_SNAKE_CASE`, often prefixed with the enum name or a related category.
+    -   Example: `typedef enum { DISPLAY_CMD_ACTIVATE_SCREEN, DISPLAY_CMD_START_ANIMATION } DisplayCommandID_e;`
+    -   Example: `typedef enum { BUTTON_ID_A, BUTTON_ID_B, BUTTON_ID_UP } ButtonID_e;`
+
+### 2.2 Formatting
+-   **Indentation:** 4 spaces. No tabs.
+-   **Brace Style:** K&R style variation (opening brace on the same line for functions, control structures; closing brace on its own line).
+    ```c
+    void function_name(int parameter) {
+        if (condition) {
+            // Code
+        } else {
+            // Code
+        }
+    }
+    ```
+-   **Max Line Length:** 100-120 characters. Strive for readability; break long lines thoughtfully.
+-   **Spaces:**
+    -   Around binary operators (`=`, `+`, `-`, `*`, `/`, `==`, `!=`, `&&`, `||`, etc.). Example: `a = b + c;`
+    -   After commas. Example: `function_call(arg1, arg2);`
+    -   After keywords like `if`, `for`, `while`, `switch`. Example: `if (condition)`
+    -   Not inside parentheses for function calls or expressions: `function(arg)` not `function( arg )`.
+    -   Not before a semicolon.
+-   **Blank Lines:**
+    -   Use sparingly to group logical sections of code.
+    -   One blank line between function definitions.
+    -   Avoid multiple consecutive blank lines.
+-   **Pointers:** Asterisk next to the variable name.
+    -   Example: `char* buffer;`, `const MyDataStruct_t* data_ptr;`
+
+### 2.3 Comments
+-   **Doxygen-style for Public APIs:** All public functions, structs, enums, and macros defined in header files must have Doxygen-compatible comments.
+    ```c
+    /**
+     * @brief Initializes the display module.
+     *
+     * This function sets up the U8g2 library and clears the display.
+     * It must be called before any other display operations.
+     *
+     * @param u8g2_instance Pointer to the U8g2 instance to initialize.
+     * @param initial_contrast The initial contrast value for the display.
+     * @return true if initialization was successful, false otherwise.
+     */
+    bool Display_Init(u8g2_t* u8g2_instance, uint8_t initial_contrast);
+    ```
+-   **File Headers:** Each `.c` and `.h` file should start with a comment block:
+    ```c
+    /**
+     * @file    my_module.c
+     * @author  Your Name <your.email@example.com>
+     * @brief   Implementation of My Module functionalities.
+     * @date    YYYY-MM-DD
+     * @version 0.1
+     *
+     * (Optional: More details about the module, copyright, license)
+     */
+    ```
+-   **Inline Comments (`//`):** Use for clarifying complex or non-obvious code sections.
+    -   Keep them concise and to the point.
+    -   Place on the line above the code being commented or at the end of the line if very short.
+-   **What to Comment:**
+    -   Rationale behind non-obvious design choices.
+    -   Workarounds for known issues.
+    -   Units of variables if not clear from the name or type.
+    -   Complex algorithms or logic.
+-   **What NOT to Comment:**
+    -   Obvious code (e.g., `i++; // Increment i`).
+    -   Version control history (Git handles this).
+    -   Large blocks of commented-out code (remove it or use version control).
+
+### 2.4 `#include` Directives
+-   **Order:**
+    1.  The module's own header file first (e.g., in `my_module.c`, include `my_module.h` first). This helps ensure the header is self-contained.
+    2.  Standard C library headers (e.g., `<stdio.h>`, `<stdint.h>`, `<stdbool.h>`).
+    3.  Other library headers (e.g., FreeRTOS headers, U8g2 headers).
+    4.  Project-specific headers from other modules.
+    -   Within each group, sort alphabetically if desired, but consistency is key.
+-   **Path:** Use relative paths from the `App/` directory or other top-level include directories configured in the build system.
+    -   Example: `#include "Kernel/rtos_hooks.h"`, `#include "BSP/bsp_drivers.h"`
+-   **Header Guards:** All header files must use standard include guards:
+    ```c
+    #ifndef MY_MODULE_H
+    #define MY_MODULE_H
+
+    // Header content
+
+    #endif // MY_MODULE_H
+    ```
+    Or, preferably, use `#pragma once` if supported and consistently used across the project. For STM32CubeIDE projects, `#pragma once` is generally well-supported.
+
+### 2.5 `const` Correctness
+-   Use `const` extensively to indicate data that should not be modified.
+    -   For function parameters that are input-only, especially pointers: `void print_string(const char* str);`
+    -   For global variables that are read-only configuration values: `const uint32_t TIMEOUT_MS = 1000;`
+    -   For struct members that are immutable after initialization (if applicable).
+-   This helps the compiler optimize and catch errors where read-only data is unintentionally modified.
+
+### 2.6 Error Handling Patterns
+-   **Return Codes:** Functions that can fail should return an error code (often an enum type like `ErrorCode_e` or `bool` for simple success/failure).
+    -   `SUCCESS` or `ERROR_CODE_OK` (typically 0) for success.
+    -   Specific error codes for different failure modes.
+-   **`configASSERT(condition)`:** Use FreeRTOS's `configASSERT()` for unrecoverable errors or violations of preconditions that indicate a programming error. This will halt execution in debug builds and help identify issues quickly.
+    -   Example: `configASSERT(pointer != NULL);`
+-   Avoid returning magic numbers or NULL for error indication if a dedicated error code or boolean can be more explicit.
+-   Check return values of functions that can fail and handle errors appropriately.
+
+### 2.7 Preprocessor Macro Usage
+-   **Avoid Complex Macros:** Prefer inline functions or static functions over complex, multi-line macros, as they are easier to debug and type-safe.
+-   **Use for Constants:** Macros are suitable for defining constants (`#define MAX_RETRIES 3`).
+-   **Simple Utility Macros:** Simple, single-line utility macros are acceptable if they improve readability and are well-tested (e.g., `MIN(a,b)`, `BIT_SET(reg, bit)`).
+-   **Parenthesize Macro Arguments:** Always enclose macro arguments in parentheses to avoid operator precedence issues. Also, enclose the entire macro body in parentheses if it's an expression.
+    ```c
+    #define SQUARE(x) ((x) * (x))
+    ```
+
+### 2.8 `stdint.h` Types
+-   Use fixed-width integer types from `<stdint.h>` (e.g., `uint8_t`, `int16_t`, `uint32_t`, `int64_t`) instead of basic C types like `int`, `short`, `long` when the size and signedness of the integer are important. This ensures portability and clarity.
+-   Use `size_t` for sizes of objects in memory.
+-   Use `bool` (from `<stdbool.h>`) for boolean values (`true`, `false`).
+
+### 2.9 File Structure
+-   **Header Files (`.h`):**
+    -   Include guards.
+    -   Forward declarations (if needed).
+    -   Type definitions (structs, enums, typedefs).
+    -   Public function declarations.
+    -   Extern declarations for global variables (use sparingly).
+    -   Macro definitions relevant to the public interface.
+-   **Source Files (`.c`):**
+    -   File header comment.
+    -   `#include` directives.
+    -   Static global variable definitions.
+    -   Static function declarations (prototypes for functions local to the file).
+    -   Public function definitions.
+    -   Static function definitions.
+-   Keep related functions and data grouped together within a file.
+
+## 3. Code Review Checklist and Process
+
+Code reviews are a critical step in maintaining code quality and sharing knowledge.
+
+### 3.1 Key Aspects to Check During Review
+-   **Functionality:** Does the code do what it's intended to do? Does it meet the requirements?
+-   **Correctness:** Are there any logical errors, off-by-one errors, race conditions, or other bugs?
+-   **Adherence to Standards:** Does the code follow the Contribution and Coding Standards (this document)?
+    -   Naming conventions.
+    -   Formatting.
+    -   Commenting.
+    -   Error handling.
+-   **Clarity and Readability:** Is the code easy to understand? Are variable and function names clear? Is the logic straightforward or overly complex?
+-   **Test Coverage:** Are there new or updated unit tests for the changes? Do they provide adequate coverage? Do all tests pass?
+-   **Performance:** Are there any obvious performance issues or inefficiencies? (Especially critical for embedded systems).
+-   **Resource Usage:**
+    -   Memory: Any potential memory leaks, buffer overflows, excessive stack usage?
+    -   Power: Any impact on power consumption? Does it follow power-aware programming guidelines?
+-   **Security:** Are there any potential security vulnerabilities (e.g., buffer overflows, insecure handling of input)?
+-   **Documentation:** Is public API documentation (Doxygen) updated? Are inline comments sufficient?
+-   **Error Handling:** Are errors handled gracefully? Are return codes checked? Is `configASSERT` used appropriately?
+-   **Modularity and Reusability:** Is the code well-structured? Could any parts be made more reusable?
+-   **Simplicity:** Is the solution overly complex? Is there a simpler way to achieve the same result?
+-   **Impact on Other Modules:** Does the change have unintended consequences for other parts of the system?
+
+### 3.2 Constructive Feedback Guidelines
+-   **Be Respectful:** Frame feedback constructively and politely. Focus on the code, not the author.
+-   **Be Specific:** Clearly explain the issue and provide specific examples or suggestions.
+-   **Explain the "Why":** Help the author understand the reasoning behind your feedback.
+-   **Offer Solutions (Optional):** If you have a suggestion for improvement, offer it, but be open to other solutions.
+-   **Prioritize:** Distinguish between critical issues, important suggestions, and minor nits.
+-   **Automated Checks First:** Let linters and static analyzers catch style and simple errors first, so reviewers can focus on deeper issues.
+
+### 3.3 Roles and Responsibilities
+-   **Author:**
+    -   Responsible for the quality of their code.
+    -   Creates the PR/MR with a clear description.
+    -   Responds to review feedback promptly and addresses concerns.
+    -   Merges the PR/MR after approval.
+-   **Reviewer(s):**
+    -   Responsible for thoroughly reviewing the code against the checklist.
+    -   Provides timely and constructive feedback.
+    -   Approves the PR/MR when satisfied that quality standards are met.
+    -   Can ask clarifying questions.
+
+## 4. Proposing and Implementing Changes/New Features
+
+### 4.1 Use of Issue Tracking System (If Any)
+-   If an issue tracking system (e.g., GitHub Issues, Jira) is in use:
+    -   New features or significant bugs should be documented as issues.
+    -   Assign issues to developers or allow developers to pick them up.
+    -   Reference issue numbers in commit messages and PRs/MRs.
+    -   Update issue status as work progresses.
+-   If no formal issue tracker, use clear communication channels (e.g., team meetings, design documents) to discuss and track proposed changes.
+
+### 4.2 Design Discussion and Approval Process
+-   **Minor Changes:** For small bug fixes or trivial changes, a detailed design discussion might not be necessary. The PR/MR review process is often sufficient.
+-   **Major Changes/New Features:**
+    1.  **Proposal:** The developer proposing the change should outline the feature/change, its purpose, and a high-level design approach. This might be an issue in the tracker, a short design note, or a discussion topic.
+    2.  **Discussion:** The team discusses the proposal, considering alternatives, impact, and feasibility.
+    3.  **Design Elaboration:** For complex features, a more detailed design document (similar to `UI_System_Design.txt` or `Lock_System_Design.txt`) may be required. This document should be reviewed by relevant team members. `documentation_plan.txt` outlines the structure for these.
+    4.  **Approval:** Once the design is agreed upon, implementation can begin.
+-   The goal is to ensure alignment and avoid wasted effort on designs that are not viable or do not meet project goals.
+
+## 5. Static Analysis Compliance
+
+Static analysis tools help detect potential bugs and style issues automatically.
+
+### 5.1 Tools and Configuration
+-   **STM32CubeIDE Built-in:**
+    -   MISRA C/C++ checker.
+    -   Clang-Tidy integration.
+-   Configuration for these tools (e.g., specific MISRA ruleset, Clang-Tidy checks) should be version-controlled as part of the project if possible, or clearly documented.
+-   A defined MISRA C:2012 subset should be agreed upon and enforced.
+
+### 5.2 Expectations for Resolving Warnings/Errors
+-   **Zero Critical Issues:** Code submitted for review must have zero critical errors from the configured static analysis tools.
+-   **Address Warnings:** All warnings should be reviewed.
+    -   If a warning indicates a genuine issue, fix it.
+    -   If a warning is a false positive or acceptable in a specific context, it may be suppressed with a clear justification comment next to the suppression directive. Unjustified suppressions are not acceptable.
+    -   Systematic false positives might indicate a need to refine the static analysis tool configuration.
+-   **CI Integration:** Static analysis should be part of the Continuous Integration (CI) pipeline. PRs/MRs that introduce new static analysis violations that are not justified should be blocked from merging.
+
+This structured approach to contributions and coding standards ensures a high-quality, maintainable, and collaborative development environment for the CKOS project.

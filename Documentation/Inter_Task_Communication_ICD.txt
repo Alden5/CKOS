@@ -1,1 +1,504 @@
-This document will formally define all communication interfaces between ApplicationLogic_Task, Display_Task, and HardwareService_Task. It includes RTOS queue message structures, message IDs, purpose, producers/consumers, task notification meanings, and any direct C API calls between components within the same task. 
+# CKOS Inter-Task Communication Interface Control Document (ICD)
+
+## 0. Document Overview
+
+### 0.1 Purpose
+This document is the definitive source for defining the Application Programming Interfaces (APIs) and communication protocols between the primary RTOS tasks in the CKOS firmware: `ApplicationLogic_Task`, `Display_Task`, and `HardwareService_Task`. It specifies the structure and meaning of messages passed via RTOS queues and the values used for task notifications.
+
+### 0.2 Scope
+The scope includes:
+- General Inter-Process Communication (IPC) principles.
+- Detailed C `struct` definitions for message payloads for all inter-task queues.
+- Enumeration and precise meaning of task notification values.
+- Definitions for any direct C function calls that cross defined module boundaries but operate within the *same* task context (to be used sparingly).
+
+This ICD is essential for ensuring that tasks can communicate reliably and that changes to interfaces are managed correctly. It draws from and supports design details in `Doccumentation/architecture.txt`, `Doccumentation/UI_System_Design.txt`, and `Doccumentation/Hardware_Service_Layer_Design.txt`.
+
+### 0.3 Definitions and Acronyms
+- **IPC:** Inter-Process Communication (Inter-Task Communication in FreeRTOS context)
+- **ICD:** Interface Control Document
+- **RTOS:** Real-Time Operating System
+- **MSG_ID:** Message Identifier
+- **TASK_NOTIFY:** Task Notification
+- **AL_TASK:** `ApplicationLogic_Task`
+- **UI_TASK:** `Display_Task`
+- **HW_TASK:** `HardwareService_Task`
+
+## 1. General IPC Principles
+
+### 1.1. Data Copying vs. Pointer Passing
+-   **Default Rule:** Data is copied into messages sent via RTOS queues. The sender allocates and populates the message structure, and the receiver gets a copy. This avoids shared memory issues and simplifies lifetime management. (Ref `architecture.txt`, Section 4.4)
+-   **Pointer Passing (Restricted):**
+    -   Permitted for large, read-only data structures (e.g., pointers to constant XBM image arrays in Flash sent to `Display_Task`). The data pointed to MUST remain valid for the lifetime of the message processing by the receiver.
+    -   Permitted when `Display_Task` receives screen-specific data from `ApplicationLogic_Task` via `CMD_ACTIVATE_SCREEN`. In this case, `Display_Task` makes a deep copy of the pointed-to data into its own managed memory pool upon receiving the message (see `Doccumentation/UI_System_Design.txt`, Section 2.2). `ApplicationLogic_Task` is responsible for the validity of the pointed-to data only until `Display_Task` has copied it.
+    -   Not generally used for data that will be modified by the receiver and then read back by the sender, unless explicit synchronization mechanisms are employed (which is generally avoided).
+
+### 1.2. Timeout Policies for Queue Operations
+-   **Queue Send (`xQueueSend`):**
+    -   `ApplicationLogic_Task` sending to `Display_Task` or `HardwareService_Task`: Typically use a short timeout (e.g., 10-100ms). If the queue is full, it indicates a problem (e.g., receiver task stuck or overloaded). Log error, potentially discard message or take other corrective action.
+    -   ISRs sending to tasks (via `xQueueSendFromISR`): Must use a timeout of 0 (non-blocking).
+-   **Queue Receive (`xQueueReceive`):**
+    -   Tasks usually pend indefinitely (`portMAX_DELAY`) on their primary command queue, as they are event-driven.
+-   These policies ensure that a blocked receiver does not indefinitely block a sender, unless the sender is an ISR.
+
+### 1.3. Queue Handles (Conceptual Names)
+-   `g_display_task_queue_handle`: For AL_TASK -> UI_TASK messages.
+-   `g_hardware_service_request_queue_handle`: For AL_TASK -> HW_TASK messages.
+-   (Other queues if defined, e.g., HW_TASK -> AL_TASK for data replies, though notifications are preferred for events).
+
+## 2. Queue: `ApplicationLogic_Task` -> `Display_Task` (`g_display_task_queue_handle`)
+
+This queue is used by `ApplicationLogic_Task` to send high-level, abstract commands to `Display_Task` for UI rendering and management. Message structures are defined in `Doccumentation/UI_System_Design.txt` (Section 1.2.2) and reiterated here for completeness.
+
+### 2.1. `DisplayCommandID_t` Enum
+```c
+typedef enum {
+    // Core Screen & Element Management
+    CMD_ACTIVATE_SCREEN,        // Payload: ActivateScreenPayload_t
+    CMD_DISPLAY_REFRESH,        // Payload: None (redraws current screen with existing data)
+
+    // Animation Control
+    CMD_START_ANIMATION,        // Payload: StartAnimationPayload_t
+    CMD_STOP_ANIMATION,         // Payload: StopAnimationPayload_t
+
+    // Theme Control
+    CMD_SET_THEME,              // Payload: SetThemePayload_t
+
+    // Agent System Specific (UI part)
+    CMD_UPDATE_AGENT_OPTIONS,   // Payload: DisplayCmdAgentOptionsPayload_t (from Agent_System_Design.txt)
+
+    // Game System Specific (UI part) - Example for Spin The Wheel
+    CMD_GAME_SPIN_THE_WHEEL_SHOW_UI, // Payload: SpinTheWheelScreenData_t (from Game_System_Design.txt)
+    CMD_GAME_SPIN_THE_WHEEL_START_ANIM, // Payload: GameSpinAnimData_t (target_segment_index, duration_ms)
+    CMD_GAME_SPIN_THE_WHEEL_SHOW_RESULT, // Payload: SpinTheWheelResultData_t (from Game_System_Design.txt)
+
+    // Generic Status/Info Updates (could be part of ActivateScreenPayload_t for specific screens)
+    CMD_UPDATE_STATUS_BAR,      // Payload: StatusBarInfo_t (if a global status bar exists)
+    CMD_SHOW_MODAL_DIALOG,      // Payload: ModalDialogPayload_t (for pop-up messages)
+
+    DISPLAY_COMMAND_COUNT
+} DisplayCommandID_t;
+```
+
+### 2.2. Payload Structures
+
+#### 2.2.1 `ActivateScreenPayload_t` (for `CMD_ACTIVATE_SCREEN`)
+```c
+typedef struct {
+    ScreenID_t screen_id;           // Enum identifying the screen to activate (e.g., SCREEN_ID_MAIN_MENU)
+                                    // Defined in a shared header, e.g., screen_ids.h
+    void* screen_specific_data;     // Pointer to a struct containing all data needed for this screen.
+                                    // Display_Task will deep-copy this data.
+                                    // The actual struct type depends on screen_id.
+    size_t screen_specific_data_size; // Size of the data block pointed to by screen_specific_data.
+                                      // Used by Display_Task for deep copy.
+} ActivateScreenPayload_t;
+```
+-   **`screen_id`**: Identifies the target screen. `Display_Task` uses this to select the correct screen handler.
+-   **`screen_specific_data`**: Points to a data structure owned by `ApplicationLogic_Task`. The content and layout of this structure are specific to the `screen_id`. `Display_Task` will perform a deep copy of this data into its own memory pool.
+-   **`screen_specific_data_size`**: Must accurately reflect the size of the data block `screen_specific_data` points to, to ensure correct memory copy.
+
+#### 2.2.2 Animation Payloads (for `CMD_START_ANIMATION`, `CMD_STOP_ANIMATION`)
+Refers to structures in `Doccumentation/UI_System_Design.txt` (Section 4.1, `StartAnimationPayload_t`, `StopAnimationPayload_t`).
+```c
+// From UI_System_Design.txt Section 4.1 (Animation Engine Data Structures)
+// typedef enum AnimationType_e AnimationType_t; // ANIM_TYPE_XBM_FRAMES, ANIM_TYPE_PROPERTY_TWEEN
+// typedef struct ScreenCoordinates_s ScreenCoordinates_t; // { uint8_t x; uint8_t y; }
+// typedef uint16_t AnimationID_t; // Unique ID for animation definition
+
+// Payload for starting tween animations, part of StartAnimationPayload_t
+typedef struct {
+    float start_value;
+    float end_value;
+    // EasingFunctionID_t easing_function; // Optional
+} StartTweenAnimationSpecificPayload_t;
+
+union DisplayAnimationTypeSpecificPayload_u {
+    StartTweenAnimationSpecificPayload_t tween_params;
+};
+typedef union DisplayAnimationTypeSpecificPayload_u DisplayAnimationTypeSpecificPayload_t;
+
+typedef struct {
+    AnimationID_t animation_id;      // Refers to a predefined AnimationDefinition_t
+    AnimationType_t type;            // Type of animation (XBM, Tween)
+    ScreenCoordinates_t coordinates; // Top-left for XBMs; context-dependent for tweens
+    uint8_t loop_count;              // 0 for infinite, 1 for single play, etc.
+    DisplayAnimationTypeSpecificPayload_t type_specific_payload; // For type-specific start params
+} StartAnimationPayload_t;
+
+typedef struct {
+    AnimationID_t animation_id;
+} StopAnimationPayload_t;
+```
+
+#### 2.2.3 `SetThemePayload_t` (for `CMD_SET_THEME`)
+Refers to structures in `Doccumentation/UI_System_Design.txt` (Section 7.1, `ThemeID_t`).
+```c
+// From UI_System_Design.txt Section 7.1 (Theme Engine Data Structures)
+// typedef enum ThemeID_e ThemeID_t; // THEME_ID_BASIC, THEME_ID_ADVANCED
+
+typedef struct {
+    ThemeID_t theme_id;
+} SetThemePayload_t;
+```
+
+#### 2.2.4 `DisplayCmdAgentOptionsPayload_t` (for `CMD_UPDATE_AGENT_OPTIONS`)
+Refers to structures in `Doccumentation/Agent_System_Design.txt` (Section 5.7.3).
+```c
+// From Agent_System_Design.txt Section 5.7.3 (Dynamic Option Generation)
+#define MAX_AGENT_DISPLAY_OPTIONS 4 // Example
+
+typedef struct {
+    const char* option_text; // Text to display. Must be persistent if pointer, or copied.
+                             // If Display_Task copies, then AL_Task can use transient buffers.
+                             // For simplicity, assume Display_Task will copy text content.
+    uint16_t action_id;      // Opaque ID meaningful to ApplicationLogic_Task for this action
+} AgentOptionEntry_t;        // Note: UI_System_Design.txt might need to define this if not already.
+
+typedef struct {
+    uint8_t num_options;
+    AgentOptionEntry_t options[MAX_AGENT_DISPLAY_OPTIONS];
+    // Add selection highlight index if AL_Task dictates initial focus
+    // uint8_t focused_option_index;
+} DisplayCmdAgentOptionsPayload_t;
+```
+- **`option_text`**: `Display_Task` should copy the string content from this pointer.
+- **`action_id`**: Used by `ApplicationLogic_Task` when user selects an option.
+
+#### 2.2.5 Game Payloads (Example: Spin The Wheel)
+Refer to structures in `Doccumentation/Game_System_Design.txt` (Section 2.2.1, 2.2.2).
+```c
+// For CMD_GAME_SPIN_THE_WHEEL_SHOW_UI
+// From Game_System_Design.txt Section 2.2.1
+#define MAX_WHEEL_SEGMENTS 8
+typedef struct {
+    const char* segment_display_text; // Display_Task must copy text
+} DisplaySegmentData_t;
+
+typedef struct {
+    uint8_t num_segments;
+    DisplaySegmentData_t segments[MAX_WHEEL_SEGMENTS];
+    uint8_t highlighted_segment_index; // For showing an initial state or final result
+} SpinTheWheelScreenData_t;
+
+// For CMD_GAME_SPIN_THE_WHEEL_START_ANIM
+typedef struct {
+    uint8_t target_segment_index;
+    uint16_t duration_ms;
+    // Potentially other animation parameters like speed curve
+} GameSpinAnimData_t;
+
+// For CMD_GAME_SPIN_THE_WHEEL_SHOW_RESULT
+// From Game_System_Design.txt Section 2.2.1
+typedef struct {
+    char result_text_line1[32]; // Fixed buffer for Display_Task to own
+    char result_text_line2[32];
+} SpinTheWheelResultData_t;
+```
+
+#### 2.2.6 `StatusBarInfo_t` (for `CMD_UPDATE_STATUS_BAR`) (Conceptual)
+```c
+typedef struct {
+    bool battery_icon_visible;
+    uint8_t battery_level; // 0-100, or enum for icon state
+    bool time_visible;
+    // char current_time_str[9]; // "HH:MM:SS" - Display_Task should format this based on its needs
+    // bool new_notification_indicator_visible;
+} StatusBarInfo_t;
+```
+
+#### 2.2.7 `ModalDialogPayload_t` (for `CMD_SHOW_MODAL_DIALOG`) (Conceptual)
+```c
+#define MODAL_DIALOG_MAX_LINES 3
+#define MODAL_DIALOG_MAX_LINE_LEN 30
+typedef struct {
+    char title[MODAL_DIALOG_MAX_LINE_LEN];
+    uint8_t num_lines;
+    char lines[MODAL_DIALOG_MAX_LINES][MODAL_DIALOG_MAX_LINE_LEN];
+    // bool has_ok_button;
+    // bool has_cancel_button;
+    // uint16_t response_action_id; // Action ID if dialog expects a response routed to AL_Task
+} ModalDialogPayload_t;
+```
+
+### 2.3. Overall Message Structure for this Queue
+```c
+typedef struct {
+    DisplayCommandID_t command_id;
+    union {
+        ActivateScreenPayload_t         activate_screen_payload;
+        StartAnimationPayload_t         start_animation_payload;
+        StopAnimationPayload_t          stop_animation_payload;
+        SetThemePayload_t               set_theme_payload;
+        DisplayCmdAgentOptionsPayload_t agent_options_payload;
+
+        // Game Payloads
+        SpinTheWheelScreenData_t        spin_wheel_show_ui_payload;
+        GameSpinAnimData_t              spin_wheel_start_anim_payload;
+        SpinTheWheelResultData_t        spin_wheel_show_result_payload;
+
+        // Conceptual Payloads
+        // StatusBarInfo_t                 status_bar_payload;
+        // ModalDialogPayload_t            modal_dialog_payload;
+
+        // Other payloads as defined per command_id
+    } payload;
+} DisplayMessage_t;
+```
+-   **Processing by `Display_Task`:** `Display_Task` reads `command_id`, then accesses the appropriate member of the `payload` union. It is responsible for understanding the data type and content based on `command_id`.
+
+## 3. Queue: `ApplicationLogic_Task` -> `HardwareService_Task` (`g_hardware_service_request_queue_handle`)
+
+This queue is used by `ApplicationLogic_Task` to request hardware operations from `HardwareService_Task`. Message structures are defined in `Doccumentation/Hardware_Service_Layer_Design.txt` (Section 1.3) and reiterated here.
+
+### 3.1. `HST_Request_Type_t` Enum
+```c
+// From Hardware_Service_Layer_Design.txt Section 1.3
+typedef enum {
+    REQ_NONE = 0,
+    REQ_UNLOCK,                     // Payload: HST_UnlockParams_t
+    REQ_GET_DOOR_STATUS,            // Payload: None. Response via Task Notify.
+    REQ_READ_SENSORS,               // Payload: None. Response via Task Notify with sensor data.
+    REQ_WRITE_STORAGE,              // Payload: HST_StorageOpParams_t
+    REQ_READ_STORAGE,               // Payload: HST_StorageOpParams_t (data_ptr is buffer to fill)
+    REQ_SET_POWER_MODE,             // Payload: HST_PowerModeParams_t
+    REQ_PWM_CONTROL_RAW,            // Payload: HST_PwmControlParams_t (For HLM precise control)
+    REQ_GET_SERIAL_NUMBER,          // Payload: None. Response via Task Notify.
+    REQ_SET_RTC_ALARM,              // Payload: HST_RTCAlarmParams_t
+    REQ_GET_CURRENT_UTC,            // Payload: None. Response via Task Notify.
+    REQ_BSP_INIT_PERIPHERAL,        // Payload: HST_PeripheralInitParams_t (e.g., re-init SPI after power cycle)
+    HST_REQUEST_TYPE_COUNT
+} HST_Request_Type_t;
+```
+
+### 3.2. Payload Structures
+
+#### 3.2.1 `HST_UnlockParams_t` (for `REQ_UNLOCK`)
+```c
+// From Hardware_Service_Layer_Design.txt Section 1.3 / 2.1
+typedef struct {
+    // Parameters for REQ_UNLOCK. The HLM module in HardwareService_Task
+    // manages retry logic, temperature compensation based on its internal config and cached sensor values.
+    // ApplicationLogic_Task simply requests an unlock.
+    // No specific parameters needed from ApplicationLogic_Task for a standard unlock attempt.
+    // If different unlock profiles were needed (e.g., "gentle try", "force try"), they could be added.
+    uint8_t unlock_profile_id; // Example: 0 for default. Future use.
+} HST_UnlockParams_t;
+```
+
+#### 3.2.2 `HST_StorageOpParams_t` (for `REQ_WRITE_STORAGE`, `REQ_READ_STORAGE`)
+```c
+// From Hardware_Service_Layer_Design.txt Section 1.3
+typedef struct {
+    uint32_t logical_address_or_var_id; // For EEPROM emulation, this is likely a variable ID/index.
+    uint8_t* data_ptr;                  // Pointer to data buffer in ApplicationLogic_Task's memory.
+                                        // For READ: HW_TASK fills this buffer.
+                                        // For WRITE: HW_TASK reads from this buffer.
+    uint32_t length;                    // Number of bytes to read/write.
+                                        // For READ: max buffer length. HW_TASK returns actual bytes read.
+} HST_StorageOpParams_t;
+```
+-   **`data_ptr` for `REQ_READ_STORAGE`**: `ApplicationLogic_Task` provides a buffer. `HardwareService_Task` fills it and notifies completion. The notification might include actual bytes read if different from requested.
+
+#### 3.2.3 `HST_PowerModeParams_t` (for `REQ_SET_POWER_MODE`)
+```c
+// From Hardware_Service_Layer_Design.txt Section 1.3
+typedef enum {
+    POWER_MODE_RUN,
+    POWER_MODE_SLEEP,
+    POWER_MODE_STOP2,
+    POWER_MODE_STANDBY
+} HST_PowerMode_t;
+
+typedef struct {
+    HST_PowerMode_t mode;
+} HST_PowerModeParams_t;
+```
+
+#### 3.2.4 `HST_PwmControlParams_t` (for `REQ_PWM_CONTROL_RAW`)
+```c
+// From Hardware_Service_Layer_Design.txt Section 1.3
+typedef struct {
+    uint8_t  pwm_channel_id; // Identifier for the PWM channel (e.g., for memory wire)
+    uint16_t duty_cycle_permille; // Duty cycle in parts per thousand (0-1000)
+    uint32_t duration_ms;    // Duration to run PWM in milliseconds
+} HST_PwmControlParams_t;
+```
+
+#### 3.2.5 `HST_RTCAlarmParams_t` (for `REQ_SET_RTC_ALARM`)
+```c
+typedef struct {
+    uint32_t utc_alarm_time_seconds; // UTC timestamp for the alarm
+    // uint8_t alarm_id; // If multiple RTC alarms are managed by HW_TASK (e.g., ALARM_A, ALARM_B)
+} HST_RTCAlarmParams_t;
+```
+
+#### 3.2.6 `HST_PeripheralInitParams_t` (for `REQ_BSP_INIT_PERIPHERAL`) (Conceptual)
+```c
+typedef enum {
+    PERIPH_ID_SPI1,
+    PERIPH_ID_ADC1,
+    // ... other re-initializable peripherals
+} PeripheralID_t;
+
+typedef struct {
+    PeripheralID_t peripheral_id;
+} HST_PeripheralInitParams_t;
+```
+
+### 3.3. Overall Message Structure for this Queue
+```c
+typedef struct {
+    HST_Request_Type_t type;
+    // void* sender_task_handle; // Optional: For direct notification reply if needed, but global task handles usually known.
+    union {
+        HST_UnlockParams_t      unlock_params;
+        HST_StorageOpParams_t   storage_params;
+        HST_PowerModeParams_t   power_params;
+        HST_PwmControlParams_t  pwm_params;
+        HST_RTCAlarmParams_t    rtc_alarm_params;
+        HST_PeripheralInitParams_t peripheral_init_params;
+        // Other params for other request types
+    } params;
+    // For requests expecting data back via separate buffer (like REQ_READ_STORAGE),
+    // a transaction ID could be useful if multiple reads can be pending.
+    // uint32_t transaction_id;
+} HardwareServiceRequestMessage_t;
+```
+
+## 4. Task Notifications: `HardwareService_Task` -> `ApplicationLogic_Task`
+
+`HardwareService_Task` uses FreeRTOS task notifications (`xTaskNotify`) to send asynchronous events and simple responses to `ApplicationLogic_Task`. `ApplicationLogic_Task`'s handle is assumed to be known to `HardwareService_Task`.
+
+The 32-bit notification value is encoded as described in `Doccumentation/Hardware_Service_Layer_Design.txt` (Section 1.4).
+
+### 4.1. Event Source Identifiers (Bits 31-24)
+```c
+#define HST_EVT_SRC_OFFSET  24
+#define HST_EVT_SRC_HLM     (0x01 << HST_EVT_SRC_OFFSET) // Hardware Lock Manager
+#define HST_EVT_SRC_SENSOR  (0x02 << HST_EVT_SRC_OFFSET) // Sensor Management
+#define HST_EVT_SRC_STORAGE (0x03 << HST_EVT_SRC_OFFSET) // Storage Operations
+#define HST_EVT_SRC_POWER   (0x04 << HST_EVT_SRC_OFFSET) // Power Management
+#define HST_EVT_SRC_RTC     (0x05 << HST_EVT_SRC_OFFSET) // RTC events
+#define HST_EVT_SRC_SYSTEM  (0x0F << HST_EVT_SRC_OFFSET) // General system events from HW_TASK
+```
+
+### 4.2. Event Code Identifiers (Bits 23-16) & Data (Bits 15-0)
+
+#### 4.2.1 HLM Events (`HST_EVT_SRC_HLM`)
+-   **`HST_EVT_CODE_UNLOCK_SUCCESS (0x01 << 16)`**: Lock successfully disengaged. No data.
+    -   Value: `HST_EVT_SRC_HLM | HST_EVT_CODE_UNLOCK_SUCCESS`
+-   **`HST_EVT_CODE_UNLOCK_FAILURE_LATCH (0x02 << 16)`**: Latch mechanism failed to actuate after retries. No data.
+    -   Value: `HST_EVT_SRC_HLM | HST_EVT_CODE_UNLOCK_FAILURE_LATCH`
+-   **`HST_EVT_CODE_UNLOCK_FAILURE_BLOCKED (0x03 << 16)`**: Latch actuated, but door appears blocked (ejector sensor didn't change). No data.
+    -   Value: `HST_EVT_SRC_HLM | HST_EVT_CODE_UNLOCK_FAILURE_BLOCKED`
+-   **`HST_EVT_CODE_DOOR_CLOSED_LOCKED (0x04 << 16)`**: Door closed by user and HLM confirms latched state. No data.
+    -   Value: `HST_EVT_SRC_HLM | HST_EVT_CODE_DOOR_CLOSED_LOCKED`
+-   **`HST_EVT_CODE_DOOR_OPENED (0x05 << 16)`**: Door physically opened (ejector sensor state changed). No data.
+    -   Value: `HST_EVT_SRC_HLM | HST_EVT_CODE_DOOR_OPENED`
+-   **`HST_EVT_CODE_DOOR_STATUS_RAW (0x06 << 16)`**: Response to `REQ_GET_DOOR_STATUS`.
+    -   Data (Bits 15-0): `(ejector_active_flag << 1) | (latch_active_flag << 0)`
+        -   `ejector_active_flag`: 1 if ejector sensor active, 0 otherwise.
+        -   `latch_active_flag`: 1 if latch sensor active, 0 otherwise.
+    -   Value: `HST_EVT_SRC_HLM | HST_EVT_CODE_DOOR_STATUS_RAW | data`
+
+#### 4.2.2 Sensor Events (`HST_EVT_SRC_SENSOR`)
+-   **`HST_EVT_CODE_BUTTON_EVENT (0x01 << 16)`**: Button press or release.
+    -   Data (Bits 15-0): `(ButtonID_t & 0xFF) | (is_pressed_flag << 8)`
+        -   `ButtonID_t`: Enum (e.g., `BTN_A = 0, BTN_B = 1, ...`).
+        -   `is_pressed_flag`: 1 for press, 0 for release.
+    -   Value: `HST_EVT_SRC_SENSOR | HST_EVT_CODE_BUTTON_EVENT | data`
+-   **`HST_EVT_CODE_BATTERY_STATUS (0x02 << 16)`**: Proactive battery status update or response to `REQ_READ_SENSORS`.
+    -   Data (Bits 15-0): Battery voltage in millivolts (e.g., 3750 for 3.75V). Max 65535mV.
+    -   Value: `HST_EVT_SRC_SENSOR | HST_EVT_CODE_BATTERY_STATUS | battery_mV`
+-   **`HST_EVT_CODE_TEMPERATURE_STATUS (0x03 << 16)`**: Proactive temperature update or response to `REQ_READ_SENSORS`.
+    -   Data (Bits 15-0): Temperature in degrees Celsius * 10 (e.g., 255 for 25.5 C). Signed value needs care if direct bitfield.
+        Offset binary could be used: e.g. temp_C_x10 + 400 (range -40.0 to +120.0 C -> 0 to 1600).
+        For simplicity, assume positive temp for now, or use separate notification for negative.
+    -   Value: `HST_EVT_SRC_SENSOR | HST_EVT_CODE_TEMPERATURE_STATUS | temp_Cx10`
+-   **`HST_EVT_CODE_CHARGER_STATUS (0x04 << 16)`**: Charger IC status change.
+    -   Data (Bits 15-0): `ChargerStatus_t` enum (e.g., `CHARGER_DISCONNECTED=0, CHARGER_CHARGING=1, CHARGER_COMPLETE=2, CHARGER_FAULT=3`).
+    -   Value: `HST_EVT_SRC_SENSOR | HST_EVT_CODE_CHARGER_STATUS | ChargerStatus_t`
+
+#### 4.2.3 Storage Events (`HST_EVT_SRC_STORAGE`)
+-   **`HST_EVT_CODE_STORAGE_WRITE_RESULT (0x01 << 16)`**: Result of `REQ_WRITE_STORAGE`.
+    -   Data (Bits 15-0): `(transaction_id & 0xFF) | (success_flag << 8)`
+        -   `transaction_id`: Optional, if AL_Task sends one.
+        -   `success_flag`: 1 for success, 0 for failure.
+    -   Value: `HST_EVT_SRC_STORAGE | HST_EVT_CODE_STORAGE_WRITE_RESULT | data`
+-   **`HST_EVT_CODE_STORAGE_READ_RESULT (0x02 << 16)`**: Result of `REQ_READ_STORAGE`.
+    -   Data (Bits 15-0): `(transaction_id & 0xFF) | (success_flag << 8) | (bytes_read & 0xFF0000) >> 16` (example packing, if bytes_read needed and small)
+        Alternatively, if `bytes_read` is important, it might need a separate mechanism or AL_Task assumes requested length on success.
+        For simplicity: `success_flag` (1 if read successful and data is in AL_Task's buffer, 0 if failed).
+    -   Value: `HST_EVT_SRC_STORAGE | HST_EVT_CODE_STORAGE_READ_RESULT | success_flag`
+        (`ApplicationLogic_Task` must have provided the buffer in `HST_StorageOpParams_t.data_ptr`).
+
+#### 4.2.4 Power Events (`HST_EVT_SRC_POWER`)
+-   **`HST_EVT_CODE_POWER_MODE_CHANGED (0x01 << 16)`**: Confirmation of power mode change.
+    -   Data (Bits 15-0): `HST_PowerMode_t` enum value of the new mode.
+    -   Value: `HST_EVT_SRC_POWER | HST_EVT_CODE_POWER_MODE_CHANGED | HST_PowerMode_t`
+
+#### 4.2.5 RTC Events (`HST_EVT_SRC_RTC`)
+-   **`HST_EVT_CODE_RTC_ALARM_TRIGGERED (0x01 << 16)`**: RTC alarm (set by `REQ_SET_RTC_ALARM`) has triggered.
+    -   Data (Bits 15-0): Optional `alarm_id` if multiple alarms were distinguishable. 0 for default.
+    -   Value: `HST_EVT_SRC_RTC | HST_EVT_CODE_RTC_ALARM_TRIGGERED | alarm_id`
+-   **`HST_EVT_CODE_UTC_TIME_RESPONSE (0x02 << 16)`**: Response to `REQ_GET_CURRENT_UTC`.
+    -   Data: This is complex. A 32-bit UTC timestamp cannot fit in 16 bits.
+        This requires an alternative: `HardwareService_Task` writes to a shared struct (with mutex/semaphore protection) that `ApplicationLogic_Task` can read after notification, or `ApplicationLogic_Task` provides a buffer pointer in the request.
+        For simplicity, assume `ApplicationLogic_Task` has a known global/static variable `volatile uint32_t g_latest_utc_time_from_hw;` that `HardwareService_Task` updates before sending the notification.
+    -   Value: `HST_EVT_SRC_RTC | HST_EVT_CODE_UTC_TIME_RESPONSE` (signals data is ready in shared variable).
+
+#### 4.2.6 System Events (`HST_EVT_SRC_SYSTEM`)
+-   **`HST_EVT_CODE_SERIAL_NUMBER_RESPONSE (0x01 << 16)`**: Response to `REQ_GET_SERIAL_NUMBER`.
+    -   Data: Serial number is too long. Similar to UTC time, `HardwareService_Task` writes to a shared buffer `volatile char g_device_serial_number[SERIAL_NUM_LEN];` before notifying.
+    -   Value: `HST_EVT_SRC_SYSTEM | HST_EVT_CODE_SERIAL_NUMBER_RESPONSE` (signals data is ready).
+-   **`HST_EVT_CODE_HW_INIT_COMPLETE (0x02 << 16)`**: `HardwareService_Task` has completed its initialization.
+    -   Value: `HST_EVT_SRC_SYSTEM | HST_EVT_CODE_HW_INIT_COMPLETE`
+
+## 5. Task Notifications: ISRs -> Tasks
+
+Interrupt Service Routines (ISRs) use `vTaskNotifyGiveFromISR()` or `xTaskNotifyFromISR()` to signal tasks. This is typically used to wake a task to process an event related to the interrupt.
+
+### 5.1. ISR -> `HardwareService_Task`
+-   **Purpose:** Typically to signal that a hardware event occurred which requires processing in task context (e.g., debouncing a button, handling ADC conversion complete).
+-   **Mechanism:** `vTaskNotifyGiveFromISR(hardware_service_task_handle, &higher_priority_task_woken);`
+-   `HardwareService_Task` pends on `ulTaskNotifyTake(pdTRUE, portMAX_DELAY);`.
+-   **Notification Value Meaning:** The fact of being notified is often the signal. The value itself might be implicitly "process your peripherals" or the ISR could try to set bits if `HardwareService_Task` uses `xTaskNotifyWait`. For simple wake-ups, `vTaskNotifyGiveFromISR` is common.
+    -   Example: GPIO interrupt for a button press -> ISR calls `vTaskNotifyGiveFromISR(hw_task_handle)` -> `HardwareService_Task` wakes, checks all button GPIOs, and starts debouncing for the changed one.
+    -   Example: Charger IC status pin change interrupt -> ISR calls `vTaskNotifyGiveFromISR(hw_task_handle)` -> `HardwareService_Task` wakes, reads charger status pin, processes.
+
+### 5.2. ISR -> `ApplicationLogic_Task` (Less Common)
+-   Generally, hardware events are funneled through `HardwareService_Task`.
+-   Direct ISR-to-`ApplicationLogic_Task` notifications might occur for extremely time-sensitive application-level events not directly tied to a hardware peripheral managed by `HardwareService_Task`, but this is rare in this architecture.
+-   If used, the meaning of the notification value would need to be clearly defined, similar to HW_TASK -> AL_TASK notifications.
+
+## 6. System Component Internal APIs (Direct C Calls within the *same* Task Context)
+
+As per `documentation_plan.txt`, these are to be used sparingly. They are direct function calls between logical modules that operate within the same RTOS task.
+
+### 6.1. Example: Within `ApplicationLogic_Task`
+-   `ApplicationLogic_Task` might contain logical modules for `LockSystem`, `AgentSystem`, `GameSystem`.
+-   **`LockSystem_ProcessEvent(event_t event)` called by `AgentSystem`:**
+    -   Signature: `bool LockSystem_ProcessEvent(App_Event_t event_code, void* event_data);`
+    -   Parameters:
+        -   `event_code (App_Event_t)`: Enum defining an internal event type (e.g., `APP_EVENT_AGENT_REQUESTS_BREAK`).
+        -   `event_data (void*)`: Pointer to data associated with the event.
+    -   Return: `bool` (e.g., true if event processed successfully).
+    -   Purpose: Agent System informs Lock System of an agent's decision that affects lock state.
+-   **`AgentSystem_NotifyGameOutcome(GameResult_t result)` called by `GameSystem`:**
+    -   Signature: `void AgentSystem_NotifyGameOutcome(GameID_t game_id, bool player_won, int score_change);`
+    -   Parameters: Game ID, win/loss status, score.
+    -   Return: `void`.
+    -   Purpose: Game System informs Agent System of game result to affect agent mood.
+
+### 6.2. Example: Within `HardwareService_Task`
+-   `HardwareService_Task` contains `HLM`, `SensorManager`, `StorageManager`.
+-   **`SensorManager_GetLatestTemperature_C_x10(void)` called by `HLM`:**
+    -   Signature: `int16_t SensorManager_GetLatestTemperature_C_x10(void);`
+    -   Parameters: None.
+    -   Return: `int16_t` (Temperature in Celsius * 10).
+    -   Purpose: HLM needs current temperature for memory wire compensation.
+-   **`PowerManager_RequestDeepSleepBlock(void)` (equivalent to `ckos_power_insomnia_enter()`) called by `StorageManager`:**
+    -   This is more likely to be a direct call to the global `ckos_power_insomnia_enter()` rather than a module-specific API if `ckos_power_insomnia_level` is a global utility.
+
+**Note:** These internal APIs are not for inter-task communication. They are standard function calls, and their use implies tight coupling between the modules within the same task. They must not block for extended periods if the calling task has other responsibilities.

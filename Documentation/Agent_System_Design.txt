@@ -817,9 +817,9 @@ typedef struct {
 } EnhancedRequestHistory_t;
 ```
 
-### 5.3 Advanced Request Handling
+### 5.4 Advanced Request Handling
 
-#### 5.3.1 Combo Requests
+#### 5.4.1 Combo Requests
 Some requests can be combined for special outcomes:
 - **Increase Time + Play Game:** "I'll stay locked longer if we can play"
   - Higher game approval (80%)
@@ -831,14 +831,14 @@ Some requests can be combined for special outcomes:
   - Tracks promise for trust impact
   - Major trust loss if broken (-25)
 
-#### 5.3.2 Trust-Based Variations
+#### 5.4.2 Trust-Based Variations
 High trust unlocks special request options:
 - **Trust 60+:** "Emergency Unlock" option appears for early unlock
 - **Trust 70+:** "Extended Break" option (up to 30 minutes)
 - **Trust 80+:** "Honor System" - agent may grant requests based on user's word alone
 - **Trust 90+:** "Flexible Schedule" - user can negotiate custom lock arrangements
 
-#### 5.3.3 Repeated Request Handling
+#### 5.4.3 Repeated Request Handling
 ```c
 // Escalating responses to repeated requests
 if (consecutive_denials[REQUEST_DECREASE_TIME] >= 3) {
@@ -856,14 +856,14 @@ if (request_count_session[REQUEST_INCREASE_TIME] >= 3) {
 }
 ```
 
-### 5.4 Decision Points
+### 5.5 Decision Points
 Key scenarios where agent decisions are critical:
 - Evaluating user requests based on type, history, and mood
 - Offering unsolicited rewards for good behavior
 - Deciding request parameters (e.g., break duration, time reduction amount)
 - Selecting appropriate games based on mood and trust
 
-### 5.5 General Decision Factors
+### 5.6 General Decision Factors
 Beyond request-specific factors, decisions are influenced by:
 - **Mood Dimensions** (most significant):
   - `strictness_level`: Primary factor for rule-based decisions
@@ -876,10 +876,10 @@ Beyond request-specific factors, decisions are influenced by:
 - **Accumulated Lock Time**: Long-term relationship development
 - **Context-Specific Rules**: Hard limits regardless of mood
 
-### 5.6 Enhanced Decision Algorithm
+### 5.7 Enhanced Decision Algorithm
 A sophisticated system combining rules, probabilities, relationship context, and adaptive learning:
 
-#### 5.6.1 Multi-Layer Decision Process
+#### 5.7.1 Multi-Layer Decision Process
 1. **Eligibility Check:** Verify request is available based on trust/history
 2. **Cooldown Verification:** Check time-based restrictions
 3. **Context Analysis:** Evaluate current relationship state and recent interactions
@@ -1037,10 +1037,10 @@ RequestContext_t analyze_request_context(AgentRuntimeState_t* state,
     }
     ```
 
-### 5.7 Dynamic Option Generation System
+### 5.8 Dynamic Option Generation System
 The enhanced request system generates contextually appropriate options that evolve based on relationship state, recent interactions, and agent personality. Options are intelligently filtered and prioritized to create natural interaction flows.
 
-#### 5.7.1 Intelligent Option Filtering
+#### 5.8.1 Intelligent Option Filtering
 ```c
 void generate_contextual_options(AgentRuntimeState_t* state, 
                                EnhancedRequestHistory_t* history,
@@ -1157,7 +1157,7 @@ typedef enum {
 } OptionPriority_t;
 ```
 
-#### 5.7.2 Context-Sensitive Option Text
+#### 5.8.2 Context-Sensitive Option Text
 Options dynamically change their display text based on agent mood and relationship state:
 
 ```c
@@ -1198,7 +1198,7 @@ const char* get_contextual_option_text(DetailedRequestType_t request_type,
 }
 ```
 
-#### 5.7.3 Agent-Responsive Option Evolution
+#### 5.8.3 Agent-Responsive Option Evolution
 Options change based on agent's most recent response to create natural conversation flow:
 
 ```c

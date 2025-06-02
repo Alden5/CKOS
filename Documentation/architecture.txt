@@ -308,8 +308,8 @@
 			- **Animation Engine:** Solely responsible for the execution of all visual animations (e.g., menu scrolling, character transitions). Manages a list of active animations, their current frame, and metadata (sprite sheet C array pointers, frame rate, looping). `ApplicationLogic_Task` commands `Display_Task` to start/stop/change animations. The engine handles frame-by-frame updates, redrawing necessary framebuffer portions. Animation timing is driven by a dedicated RTOS timer for smooth and consistent playback, signaling `Display_Task` to process animation frames.
 			- **Framebuffer Management & Partial Updates:**
 				* Manages the full internal display framebuffer (e.g., `static uint8_t display_framebuffer[1024];`). All U8g2 drawing operations target this buffer.
-				* Implements manual partial update logic. After a screen is drawn/updated into the framebuffer, `Display_Task` identifies the changed regions (e.g., by comparing with a copy of the previous frame or using dirty rectangle tracking).
-				* Instructs the BSP (via functions like `bsp_display_update_region(x, y, w, h, region_data_ptr)`) to send only these modified regions to the physical display controller. This minimizes data transfer over SPI/I2C and reduces power consumption.
+				* Uses full framebuffer updates. While partial updates were initially considered for power saving, full updates were chosen to simplify implementation, and the power impact is managed through other strategies like minimizing update frequency.
+				* Instructs the BSP (via functions like `bsp_display_update_region(x, y, w, h, region_data_ptr)` or `bsp_display_send_buffer()`) to send the frame data to the physical display controller.
 			- **Resource Handling:** Accesses compiled-in UI assets like fonts (defined as U8g2 C arrays) and image C arrays (converted from PBMs).
 			- **Theme Management:** Applies UI themes based on settings received from `ApplicationLogic_Task`. Drawing functions for UI elements and components use parameters from the active theme (e.g., fonts, border styles, foreground/background conventions for monochrome).
 
